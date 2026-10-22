@@ -174,7 +174,7 @@ static __device__ __forceinline__ void swiglu_fwd_kernel(
                 auto &hidden_fp8_t_smem = reinterpret_cast<quant_fp8_tile &>(up_smem[stage]);
                 auto &hidden_sc_t_smem = *reinterpret_cast<quant_sc_tile *>(reinterpret_cast<uint64_t>(&up_smem[stage]) + sizeof(hidden_fp8_t_smem));
 
-                mxfp8::quantize_tile<true, true>(hidden_quant_smem, hidden_fp8_smem, hidden_sc_smem, hidden_fp8_t_smem, hidden_sc_t_smem, nullptr, threadIdx.x, 1);
+                mxfp8::quantize_tile<true, true, 128, false, false, QUANT_BLOCK_SIZE>(hidden_quant_smem, hidden_fp8_smem, hidden_sc_smem, hidden_fp8_t_smem, hidden_sc_t_smem, nullptr, threadIdx.x, 1);
                 __syncthreads();
 
                 if (threadIdx.x == 0) {
@@ -359,11 +359,10 @@ static __device__ __forceinline__ void swiglu_bwd_kernel(
 
                 const int k_block_pair = ((tile_row >> 1) & 1) ^ tile_col_half;
                 uint32_t d_gate_scale_byte[2], d_up_scale_byte[2];
-                #pragma unroll 1
-                for (int j = 0; j < 2; ++j) { // 64 elements per thread = 2 32-element blocks per thread
-                    const int k_block_idx = k_block_pair * 2 + ((tile_row + j) & 1);
 
-                    // Load this block's gate/up values and the incoming d_hidden gradient
+                // Loads one block's gate/up values and the incoming d_hidden gradient, applies the SwiGLU backward,
+                // and accumulates the router-weight gradient
+                auto compute_block = [&](int k_block_idx, bf16_2 (&d_gate_bf16)[16], bf16_2 (&d_up_bf16)[16]) {
                     uint32_t gate_fp8[8], up_fp8[8];
                     float2 d_hidden_fp32[16];
                     #pragma unroll
@@ -378,34 +377,100 @@ static __device__ __forceinline__ void swiglu_bwd_kernel(
                         d_hidden_fp32[k * 2 + 1] = __bfloat1622float2(d_hidden_pairs[1]);
                     }
 
-                    // Dequantize
+                    // Dequantize (blockwise scales are replicated per sub-block, so the same indexing applies)
                     float2 gate_fp32[16], up_fp32[16];
                     mxfp8::dequantize_single_block(gate_fp8, (static_cast<uint32_t>(gate_scale_word) >> (k_block_idx * 8)) & 0xFF, gate_fp32);
                     mxfp8::dequantize_single_block(up_fp8, (static_cast<uint32_t>(up_scale_word) >> (k_block_idx * 8)) & 0xFF, up_fp32);
 
                     // Apply SwiGLU backward
-                    bf16_2 d_gate_bf16[16], d_up_bf16[16];
                     #pragma unroll
                     for (int k = 0; k < 16; ++k) {
                         const float2 hidden = swiglu_bwd_pair<IS_CLAMPED>(gate_fp32[k], up_fp32[k], d_hidden_fp32[k], swiglu_limit, d_gate_bf16[k], d_up_bf16[k]);
                         router_grad_partial += d_hidden_fp32[k].x * inv_router_weight * hidden.x + d_hidden_fp32[k].y * inv_router_weight * hidden.y;
                     }
-
-                    // Quantize both gradients; also stage them in BF16 for the transpose-quantize below
-                    uint32_t d_gate_fp8[8], d_up_fp8[8];
-                    mxfp8::quantize_single_block(d_gate_bf16, d_gate_fp8, d_gate_scale_byte[j]);
-                    mxfp8::quantize_single_block(d_up_bf16, d_up_fp8, d_up_scale_byte[j]);
-                    const uint32_t *d_gate_bf16_words = reinterpret_cast<const uint32_t *>(d_gate_bf16);
-                    const uint32_t *d_up_bf16_words = reinterpret_cast<const uint32_t *>(d_up_bf16);
+                };
+                // Stores one block of quantized gradients over the gate/up inputs
+                auto store_fp8_block = [&](int k_block_idx, const uint32_t (&d_gate_fp8)[8], const uint32_t (&d_up_fp8)[8]) {
                     #pragma unroll
                     for (int k = 0; k < 8; ++k) {
                         const int col_idx = k_block_idx * MXFP8_Kb + ((tile_row / 4 + k) % 8) * 4;
                         move<int>::sts(gate_fp8_addr + tile_row * config::SWIGLU_Nb + col_idx, std::bit_cast<int>(d_gate_fp8[k]));
                         move<int>::sts(up_fp8_addr + tile_row * config::SWIGLU_Nb + col_idx, std::bit_cast<int>(d_up_fp8[k]));
+                    }
+                };
+                // Stages one block of BF16 gradients for the transpose-quantize below (d_gate over the d_hidden input, d_up in the shared staging buffer)
+                auto store_bf16_block = [&](int k_block_idx, const bf16_2 (&d_gate_bf16)[16], const bf16_2 (&d_up_bf16)[16]) {
+                    const uint32_t *d_gate_bf16_words = reinterpret_cast<const uint32_t *>(d_gate_bf16);
+                    const uint32_t *d_up_bf16_words = reinterpret_cast<const uint32_t *>(d_up_bf16);
+                    #pragma unroll
+                    for (int k = 0; k < 8; ++k) {
+                        const int col_idx = k_block_idx * MXFP8_Kb + ((tile_row / 4 + k) % 8) * 4;
                         move<float2>::sts(d_hidden_addr + (tile_row * config::SWIGLU_Nb + col_idx) * static_cast<int>(sizeof(bf16)),
                                           float2{__uint_as_float(d_gate_bf16_words[k * 2]), __uint_as_float(d_gate_bf16_words[k * 2 + 1])});
                         move<float2>::sts(d_up_bf16_addr + (tile_row * config::SWIGLU_Nb + col_idx) * static_cast<int>(sizeof(bf16)),
                                           float2{__uint_as_float(d_up_bf16_words[k * 2]), __uint_as_float(d_up_bf16_words[k * 2 + 1])});
+                    }
+                };
+
+                if constexpr (QUANT_BLOCK_SIZE == MXFP8_Kb) {
+                    #pragma unroll 1
+                    for (int j = 0; j < 2; ++j) { // 64 elements per thread = 2 32-element blocks per thread
+                        const int k_block_idx = k_block_pair * 2 + ((tile_row + j) & 1);
+                        bf16_2 d_gate_bf16[16], d_up_bf16[16];
+                        compute_block(k_block_idx, d_gate_bf16, d_up_bf16);
+
+                        // Quantize both gradients with per-block scales; also stage them in BF16 for the transpose-quantize below
+                        uint32_t d_gate_fp8[8], d_up_fp8[8];
+                        mxfp8::quantize_single_block(d_gate_bf16, d_gate_fp8, d_gate_scale_byte[j]);
+                        mxfp8::quantize_single_block(d_up_bf16, d_up_fp8, d_up_scale_byte[j]);
+                        store_fp8_block(k_block_idx, d_gate_fp8, d_up_fp8);
+                        store_bf16_block(k_block_idx, d_gate_bf16, d_up_bf16);
+                    }
+                } else {
+                    // Blockwise FP8: the 1x128 scale spans both threads of the row, so stage the BF16 gradients first,
+                    // exchange the half-row amaxes through shared memory, then quantize with the shared scale
+                    auto &amax_smem = *reinterpret_cast<float2 (*)[2][config::SWIGLU_Mb]>(router_smem_addr + sizeof(router_smem));
+                    bf16_2 d_gate_amax = __floats2bfloat162_rn(0.0f, 0.0f);
+                    bf16_2 d_up_amax = __floats2bfloat162_rn(0.0f, 0.0f);
+                    #pragma unroll 1
+                    for (int j = 0; j < 2; ++j) {
+                        const int k_block_idx = k_block_pair * 2 + ((tile_row + j) & 1);
+                        bf16_2 d_gate_bf16[16], d_up_bf16[16];
+                        compute_block(k_block_idx, d_gate_bf16, d_up_bf16);
+                        d_gate_amax = __hmax2(d_gate_amax, mxfp8::block_amax(d_gate_bf16));
+                        d_up_amax = __hmax2(d_up_amax, mxfp8::block_amax(d_up_bf16));
+                        store_bf16_block(k_block_idx, d_gate_bf16, d_up_bf16);
+                    }
+                    amax_smem[tile_col_half][tile_row] = float2{mxfp8::amax_to_float(d_gate_amax), mxfp8::amax_to_float(d_up_amax)};
+                    __syncthreads();
+                    const float2 other_amax = amax_smem[tile_col_half ^ 1][tile_row];
+                    const uint32_t d_gate_row_scale_byte = mxfp8::scale_byte_from_amax(fmaxf(mxfp8::amax_to_float(d_gate_amax), other_amax.x));
+                    const uint32_t d_up_row_scale_byte = mxfp8::scale_byte_from_amax(fmaxf(mxfp8::amax_to_float(d_up_amax), other_amax.y));
+                    const float d_gate_scale_inv = mxfp8::scale_inv_from_byte(d_gate_row_scale_byte);
+                    const float d_up_scale_inv = mxfp8::scale_inv_from_byte(d_up_row_scale_byte);
+                    d_gate_scale_byte[0] = d_gate_scale_byte[1] = d_gate_row_scale_byte;
+                    d_up_scale_byte[0] = d_up_scale_byte[1] = d_up_row_scale_byte;
+                    #pragma unroll 1
+                    for (int j = 0; j < 2; ++j) {
+                        const int k_block_idx = k_block_pair * 2 + ((tile_row + j) & 1);
+                        bf16_2 d_gate_bf16[16], d_up_bf16[16];
+                        #pragma unroll
+                        for (int k = 0; k < 8; ++k) {
+                            const int col_idx = k_block_idx * MXFP8_Kb + ((tile_row / 4 + k) % 8) * 4;
+                            float2 d_gate_packed, d_up_packed;
+                            move<float2>::lds(d_gate_packed, d_hidden_addr + (tile_row * config::SWIGLU_Nb + col_idx) * static_cast<int>(sizeof(bf16)));
+                            move<float2>::lds(d_up_packed, d_up_bf16_addr + (tile_row * config::SWIGLU_Nb + col_idx) * static_cast<int>(sizeof(bf16)));
+                            const bf16_2 *d_gate_pairs = reinterpret_cast<const bf16_2 *>(&d_gate_packed);
+                            const bf16_2 *d_up_pairs = reinterpret_cast<const bf16_2 *>(&d_up_packed);
+                            d_gate_bf16[k * 2] = d_gate_pairs[0];
+                            d_gate_bf16[k * 2 + 1] = d_gate_pairs[1];
+                            d_up_bf16[k * 2] = d_up_pairs[0];
+                            d_up_bf16[k * 2 + 1] = d_up_pairs[1];
+                        }
+                        uint32_t d_gate_fp8[8], d_up_fp8[8];
+                        mxfp8::quantize_block_with_scale(d_gate_bf16, d_gate_fp8, d_gate_scale_inv);
+                        mxfp8::quantize_block_with_scale(d_up_bf16, d_up_fp8, d_up_scale_inv);
+                        store_fp8_block(k_block_idx, d_gate_fp8, d_up_fp8);
                     }
                 }
 
@@ -425,9 +490,9 @@ static __device__ __forceinline__ void swiglu_bwd_kernel(
 
                 // Transpose-quantize both gradients, one per warpgroup; d_gate was staged in the d_hidden tile, d_up in the shared staging buffer
                 if (threadIdx.x < config::QUANT_Mb)
-                    mxfp8::quantize_tile<false, true>(d_hidden_smem[stage], d_t_fp8_smem[0], d_t_sc_smem[0], d_t_fp8_smem[0], d_t_sc_smem[0], nullptr, threadIdx.x, 1);
+                    mxfp8::quantize_tile<false, true, 128, false, false, QUANT_BLOCK_SIZE>(d_hidden_smem[stage], d_t_fp8_smem[0], d_t_sc_smem[0], d_t_fp8_smem[0], d_t_sc_smem[0], nullptr, threadIdx.x, 1);
                 else
-                    mxfp8::quantize_tile<false, true>(d_up_bf16_smem, d_t_fp8_smem[1], d_t_sc_smem[1], d_t_fp8_smem[1], d_t_sc_smem[1], nullptr, threadIdx.x - config::QUANT_Mb, 2);
+                    mxfp8::quantize_tile<false, true, 128, false, false, QUANT_BLOCK_SIZE>(d_up_bf16_smem, d_t_fp8_smem[1], d_t_sc_smem[1], d_t_fp8_smem[1], d_t_sc_smem[1], nullptr, threadIdx.x - config::QUANT_Mb, 2);
                 
                 // Store partial router gradient to smem for the first col half to handle later
                 if (tile_col_half != 0) 

@@ -109,6 +109,19 @@ Because symmetric buffers are expensive to allocate, we recommend creating a sin
 
 To run MoK in MXFP8 mode, pass the activations as-is in BF16 while prequantizing the weights to MXFP8. We *could* quantize the weights inside our kernels, but prequantizing leaves better opportunities for things like FSDP, so we keep it separate and provide the `mxfp8_quantize(...)` function at the ops layer so you can prequantize the weights yourself.
 
+### Blockwise FP8
+
+Besides MXFP8 (one UE8M0 scale per 1x32 block), MoK supports a *blockwise* FP8 recipe in the style of DeepSeek-V3: one
+UE8M0 scale per 1x128 block of activations and per 128x128 block of weights. Blackwell's block-scaled tensor-core
+instructions only accept 32-element UE8M0 scales, so the blockwise scales are replicated over the 32-element sub-blocks
+they cover; the tensors, scale layouts and GEMM mainloop are therefore identical to MXFP8 and only the scale granularity
+changes (arbitrary FP32 scales are not supported by the hardware and are not implemented).
+
+To use it, set `fp8_recipe="blockwise"` in the `MoKConfig`, prequantize the routed weights with
+`ops.blockwise_fp8_quantize(w, True, True, 128)` instead of `ops.mxfp8_quantize(w, True, True)`, and otherwise call the
+functional API exactly as in the MXFP8 example below. `ops.blockwise_fp8_quantize(x, ..., 1)` exposes the 1x128
+activation quantizer. Because the blocks are coarser than MXFP8's, expect slightly larger quantization error.
+
 ### Example (MXFP8 forward and backward using the functional layer)
 
 The following is a canonical example of implementing MoE forward and backward with MoK in MXFP8 mode:

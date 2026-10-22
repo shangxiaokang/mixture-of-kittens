@@ -176,21 +176,36 @@ def run_schedule_reference(
     return schedule_peer_rank, schedule_peer_token_idx, num_tokens, tokens_per_expert
 
 
-def run_mxfp8_quantize_normal_reference(
+def run_fp8_quantize_normal_reference(
     x_bf16: torch.Tensor,
+    block_rows: int = 1,
+    block_cols: int = 32,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """FP8 E4M3 quantization with one UE8M0 scale per block_rows x block_cols block (MXFP8: 1x32).
+
+    Scales are emitted in the tcgen05 layout (one byte per 32 elements), replicated within a block.
+    """
     is_2d = x_bf16.ndim == 2
     x_bf16_3d = x_bf16.unsqueeze(0) if is_2d else x_bf16
     num_experts, rows, columns = x_bf16_3d.shape
+    total_rows = num_experts * rows
+    assert total_rows % block_rows == 0 and columns % block_cols == 0 and block_cols % 32 == 0
 
-    x_float = x_bf16_3d.float().reshape(num_experts * rows, columns)
+    x_float = x_bf16_3d.float().reshape(total_rows, columns)
     dest_max = torch.tensor(448.0, dtype=torch.float32, device=x_bf16.device)
     min_exp = torch.tensor(-127.0, dtype=torch.float32, device=x_bf16.device)
     fp8e8m0_bias = torch.tensor(127.0, dtype=torch.float32, device=x_bf16.device)
 
-    block_amax = x_float.abs().view(num_experts * rows, columns // 32, 32).amax(dim=-1)
+    block_amax = (
+        x_float.abs()
+        .view(total_rows // block_rows, block_rows, columns // block_cols, block_cols)
+        .amax(dim=(1, 3))
+    )
     decode_scale = block_amax / dest_max
     scale_exponent = torch.clamp(torch.ceil(torch.log2(decode_scale)), min=min_exp)
+    scale_exponent = (
+        scale_exponent.repeat_interleave(block_rows, dim=0).repeat_interleave(block_cols // 32, dim=1)
+    )  # one exponent per 32-element hardware sub-block
     x_fp8 = (x_float / (2 ** scale_exponent.repeat_interleave(32, dim=-1))).to(torch.float8_e4m3fn)
     x_fp8 = x_fp8.reshape(num_experts, rows, columns)
 
@@ -202,6 +217,33 @@ def run_mxfp8_quantize_normal_reference(
     return (x_fp8.squeeze(0) if is_2d else x_fp8), scales
 
 
+def run_mxfp8_quantize_normal_reference(
+    x_bf16: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return run_fp8_quantize_normal_reference(x_bf16, 1, 32)
+
+
+def run_fp8_quantize_reference(
+    x_bf16: torch.Tensor,
+    return_normal: bool,
+    return_transposed: bool,
+    block_rows: int,
+    block_cols: int,
+) -> tuple[
+    torch.Tensor | None, torch.Tensor | None,  # x_fp8, x_sc
+    torch.Tensor | None, torch.Tensor | None,  # x_fp8_t, x_sc_t
+]:
+    if return_normal:
+        x_fp8, x_sc = run_fp8_quantize_normal_reference(x_bf16, block_rows, block_cols)
+    else:
+        x_fp8, x_sc = None, None
+    if return_transposed:
+        x_fp8_t, x_sc_t = run_fp8_quantize_normal_reference(x_bf16.transpose(-2, -1).contiguous(), block_rows, block_cols)
+    else:
+        x_fp8_t, x_sc_t = None, None
+    return x_fp8, x_sc, x_fp8_t, x_sc_t
+
+
 def run_mxfp8_quantize_reference(
     x_bf16: torch.Tensor,
     return_normal: bool,
@@ -210,15 +252,20 @@ def run_mxfp8_quantize_reference(
     torch.Tensor | None, torch.Tensor | None,  # x_fp8, x_sc
     torch.Tensor | None, torch.Tensor | None,  # x_fp8_t, x_sc_t
 ]:
-    if return_normal:
-        x_fp8, x_sc = run_mxfp8_quantize_normal_reference(x_bf16)
-    else:
-        x_fp8, x_sc = None, None
-    if return_transposed:
-        x_fp8_t, x_sc_t = run_mxfp8_quantize_normal_reference(x_bf16.transpose(-2, -1).contiguous())
-    else:
-        x_fp8_t, x_sc_t = None, None
-    return x_fp8, x_sc, x_fp8_t, x_sc_t
+    return run_fp8_quantize_reference(x_bf16, return_normal, return_transposed, 1, 32)
+
+
+def run_blockwise_fp8_quantize_reference(
+    x_bf16: torch.Tensor,
+    return_normal: bool,
+    return_transposed: bool,
+    block_rows: int,
+) -> tuple[
+    torch.Tensor | None, torch.Tensor | None,  # x_fp8, x_sc
+    torch.Tensor | None, torch.Tensor | None,  # x_fp8_t, x_sc_t
+]:
+    # 1x128 (activations) or 128x128 (weights) blocks; a 128x128 block has the same scale in both layouts
+    return run_fp8_quantize_reference(x_bf16, return_normal, return_transposed, block_rows, 128)
 
 
 def run_swiglu_reference(

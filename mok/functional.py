@@ -10,15 +10,24 @@ from .ops import (
     all_gather_top_experts,
     barrier_all,
     bwd_epilogue,
+    dispatch_mlp_swiglu_combine_bwd_blockwise_fp8,
     dispatch_mlp_swiglu_combine_bwd_mxfp8,
     dispatch_mlp_swiglu_combine_bwd_bf16,
+    recompute_forward_context_blockwise_fp8,
     recompute_forward_context_mxfp8,
     recompute_forward_context_bf16,
+    dispatch_mlp_swiglu_combine_fwd_blockwise_fp8,
     dispatch_mlp_swiglu_combine_fwd_mxfp8,
     dispatch_mlp_swiglu_combine_fwd_bf16,
     fwd_epilogue,
     schedule,
 )
+
+
+# FP8 recipes for the routed experts (selected by MoKConfig.fp8_recipe; BF16 is selected by passing plain BF16 weights):
+#   "mxfp8":     one UE8M0 scale per 1x32 block (activations and weights)
+#   "blockwise": one UE8M0 scale per 1x128 block of activations and per 128x128 block of weights
+FP8_RECIPES = ("mxfp8", "blockwise")
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,6 +38,20 @@ class MoKConfig:
     macrobatch_size: int = 131072
     schedule_capacity_multiplier: float = 0.5
     all_gather_top_experts_chunk_bytes: int = 2048
+    fp8_recipe: str = "mxfp8"
+
+
+def _fp8_ops(config: MoKConfig) -> tuple[Any, Any, Any]:
+    """Returns the (forward, recompute_forward_context, backward) megakernel ops for the config's FP8 recipe."""
+    if config.fp8_recipe == "mxfp8":
+        return (dispatch_mlp_swiglu_combine_fwd_mxfp8,
+                recompute_forward_context_mxfp8,
+                dispatch_mlp_swiglu_combine_bwd_mxfp8)
+    if config.fp8_recipe == "blockwise":
+        return (dispatch_mlp_swiglu_combine_fwd_blockwise_fp8,
+                recompute_forward_context_blockwise_fp8,
+                dispatch_mlp_swiglu_combine_bwd_blockwise_fp8)
+    raise ValueError(f"fp8_recipe must be one of {FP8_RECIPES}, got {config.fp8_recipe!r}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,6 +142,8 @@ def validate_workspace_args(
         or config.schedule_capacity_multiplier <= 0
     ):
         raise ValueError("schedule_capacity_multiplier must be a positive finite number")
+    if config.fp8_recipe not in FP8_RECIPES:
+        raise ValueError(f"fp8_recipe must be one of {FP8_RECIPES}, got {config.fp8_recipe!r}")
     if not dist.is_initialized():
         raise RuntimeError("torch.distributed must be initialized")
     if not isinstance(group, dist.ProcessGroup):
@@ -495,9 +520,9 @@ def forward(
         shared_gate_weights: bfloat16 [intermediate_size, hidden_size]
         shared_up_weights:   bfloat16 [intermediate_size, hidden_size]
         shared_down_weights: bfloat16 [hidden_size, intermediate_size]
-        routed_gate_weights: bfloat16 [num_local_experts, intermediate_size, hidden_size] or MXFP8 data/scale tuple
-        routed_up_weights:   bfloat16 [num_local_experts, intermediate_size, hidden_size] or MXFP8 data/scale tuple
-        routed_down_weights: bfloat16 [num_local_experts, hidden_size, intermediate_size] or MXFP8 data/scale tuple
+        routed_gate_weights: bfloat16 [num_local_experts, intermediate_size, hidden_size] or FP8 data/scale tuple (recipe per config.fp8_recipe)
+        routed_up_weights:   bfloat16 [num_local_experts, intermediate_size, hidden_size] or FP8 data/scale tuple (recipe per config.fp8_recipe)
+        routed_down_weights: bfloat16 [num_local_experts, hidden_size, intermediate_size] or FP8 data/scale tuple (recipe per config.fp8_recipe)
         swiglu_limit:        float | None
 
     Outputs:
@@ -519,7 +544,7 @@ def forward(
          gate_shared, gate_fp8_routed, gate_sc_routed,
          up_shared, up_fp8_routed, up_sc_routed,
          hidden_shared, hidden_fp8_t_routed, hidden_sc_t_routed,
-         y_shared, y_routed) = dispatch_mlp_swiglu_combine_fwd_mxfp8(
+         y_shared, y_routed) = _fp8_ops(config)[0](
             workspace.x_buffer, workspace.x_buffer_ptrs,
             workspace.combine_buffer, workspace.combine_buffer_ptrs,
             shared_gate_weights, routed_gate_weights_fp8, routed_gate_weights_sc,
@@ -588,8 +613,8 @@ def recompute_forward_context(
         x:                   bfloat16 [num_local_tokens, hidden_size]
         shared_gate_weights: bfloat16 [intermediate_size, hidden_size]
         shared_up_weights:   bfloat16 [intermediate_size, hidden_size]
-        routed_gate_weights: bfloat16 [num_local_experts, intermediate_size, hidden_size] or MXFP8 data/scale tuple
-        routed_up_weights:   bfloat16 [num_local_experts, intermediate_size, hidden_size] or MXFP8 data/scale tuple
+        routed_gate_weights: bfloat16 [num_local_experts, intermediate_size, hidden_size] or FP8 data/scale tuple (recipe per config.fp8_recipe)
+        routed_up_weights:   bfloat16 [num_local_experts, intermediate_size, hidden_size] or FP8 data/scale tuple (recipe per config.fp8_recipe)
         swiglu_limit:        float | None
 
     Outputs:
@@ -599,7 +624,7 @@ def recompute_forward_context(
     if isinstance(routed_gate_weights, tuple) != isinstance(routed_up_weights, tuple):
         raise TypeError("routed gate and up weights must use the same precision representation")
     if isinstance(routed_gate_weights, tuple) and (len(routed_gate_weights) != 2 or len(routed_up_weights) != 2):
-        raise ValueError("MXFP8 routed gate and up weights must be data/scale pairs")
+        raise ValueError("FP8 routed gate and up weights must be data/scale pairs")
 
     workspace.x_buffer.copy_(x)
     barrier_all(workspace.barrier_buffer, workspace.barrier_buffer_ptrs,
@@ -611,7 +636,7 @@ def recompute_forward_context(
         (x_fp8_t_routed, x_sc_t_routed,
          gate_shared, gate_fp8_routed, gate_sc_routed,
          up_shared, up_fp8_routed, up_sc_routed,
-         hidden_shared, hidden_fp8_t_routed, hidden_sc_t_routed) = recompute_forward_context_mxfp8(
+         hidden_shared, hidden_fp8_t_routed, hidden_sc_t_routed) = _fp8_ops(config)[1](
             workspace.x_buffer, workspace.x_buffer_ptrs,
             shared_gate_weights, routed_gate_weights_fp8, routed_gate_weights_sc,
             shared_up_weights, routed_up_weights_fp8, routed_up_weights_sc,
@@ -687,9 +712,9 @@ def backward(
         shared_gate_weights: bfloat16 [intermediate_size, hidden_size]
         shared_up_weights:   bfloat16 [intermediate_size, hidden_size]
         shared_down_weights: bfloat16 [hidden_size, intermediate_size]
-        routed_gate_weights: bfloat16 [num_local_experts, intermediate_size, hidden_size] or MXFP8 tensor tuple
-        routed_up_weights:   bfloat16 [num_local_experts, intermediate_size, hidden_size] or MXFP8 tensor tuple
-        routed_down_weights: bfloat16 [num_local_experts, hidden_size, intermediate_size] or MXFP8 tensor tuple
+        routed_gate_weights: bfloat16 [num_local_experts, intermediate_size, hidden_size] or FP8 tensor tuple (recipe per config.fp8_recipe)
+        routed_up_weights:   bfloat16 [num_local_experts, intermediate_size, hidden_size] or FP8 tensor tuple (recipe per config.fp8_recipe)
+        routed_down_weights: bfloat16 [num_local_experts, hidden_size, intermediate_size] or FP8 tensor tuple (recipe per config.fp8_recipe)
         swiglu_limit:        float | None
 
     Outputs:
@@ -726,7 +751,7 @@ def backward(
          d_up_shared, d_up_fp8_routed, d_up_sc_routed,
          d_hidden_shared, d_hidden_routed, d_y_fp8_routed, d_y_sc_routed,
          d_w_shared_gate, d_w_routed_gate, d_w_shared_up, d_w_routed_up,
-         d_w_shared_down, d_w_routed_down) = dispatch_mlp_swiglu_combine_bwd_mxfp8(
+         d_w_shared_down, d_w_routed_down) = _fp8_ops(config)[2](
             workspace.d_y_buffer, workspace.d_y_buffer_ptrs,
             workspace.d_x_routed_buffer, workspace.d_x_routed_buffer_ptrs,
             workspace.router_weight_buffer, workspace.router_weight_buffer_ptrs,

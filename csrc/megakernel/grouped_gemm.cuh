@@ -296,29 +296,31 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
           if (d_routed_gmem != nullptr) {
             constexpr int NUM_MXFP8_BLOCKS = config::MLP_Nb / 32;
             const int tile_row = warpgroup::laneid();
-            uint32_t scale_word = 0;
-            #pragma unroll 1
-            for (int i = 0; i < NUM_MXFP8_BLOCKS; ++i) {
+
+            // Loads one 32-column chunk of this warp's 32 accumulator rows from tensor memory as BF16
+            auto load_chunk = [&](int i, bf16_2 (&d_reg)[16]) {
                 float2 tmp[16];
-                asm volatile(R"(
-                    tcgen05.ld.sync.aligned.32x32b.x32.b32
-                    {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15,
-                     %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];
-                    )"
-                    : "=f"(tmp[0].x), "=f"(tmp[0].y), "=f"(tmp[1].x), "=f"(tmp[1].y),
-                      "=f"(tmp[2].x), "=f"(tmp[2].y), "=f"(tmp[3].x), "=f"(tmp[3].y),
-                      "=f"(tmp[4].x), "=f"(tmp[4].y), "=f"(tmp[5].x), "=f"(tmp[5].y),
-                      "=f"(tmp[6].x), "=f"(tmp[6].y), "=f"(tmp[7].x), "=f"(tmp[7].y),
-                      "=f"(tmp[8].x), "=f"(tmp[8].y), "=f"(tmp[9].x), "=f"(tmp[9].y),
-                      "=f"(tmp[10].x), "=f"(tmp[10].y), "=f"(tmp[11].x), "=f"(tmp[11].y),
-                      "=f"(tmp[12].x), "=f"(tmp[12].y), "=f"(tmp[13].x), "=f"(tmp[13].y),
-                      "=f"(tmp[14].x), "=f"(tmp[14].y), "=f"(tmp[15].x), "=f"(tmp[15].y)
-                    : "r"(d_tt.addr + ((warpgroup::warpid() * 32) << 16) + i * 32));
+                    asm volatile(R"(
+                        tcgen05.ld.sync.aligned.32x32b.x32.b32
+                        {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15,
+                         %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];
+                        )"
+                        : "=f"(tmp[0].x), "=f"(tmp[0].y), "=f"(tmp[1].x), "=f"(tmp[1].y),
+                          "=f"(tmp[2].x), "=f"(tmp[2].y), "=f"(tmp[3].x), "=f"(tmp[3].y),
+                          "=f"(tmp[4].x), "=f"(tmp[4].y), "=f"(tmp[5].x), "=f"(tmp[5].y),
+                          "=f"(tmp[6].x), "=f"(tmp[6].y), "=f"(tmp[7].x), "=f"(tmp[7].y),
+                          "=f"(tmp[8].x), "=f"(tmp[8].y), "=f"(tmp[9].x), "=f"(tmp[9].y),
+                          "=f"(tmp[10].x), "=f"(tmp[10].y), "=f"(tmp[11].x), "=f"(tmp[11].y),
+                          "=f"(tmp[12].x), "=f"(tmp[12].y), "=f"(tmp[13].x), "=f"(tmp[13].y),
+                          "=f"(tmp[14].x), "=f"(tmp[14].y), "=f"(tmp[15].x), "=f"(tmp[15].y)
+                        : "r"(d_tt.addr + ((warpgroup::warpid() * 32) << 16) + i * 32));
                 tensor_load_wait();
-                bf16_2 d_reg[16];
                 #pragma unroll
                 for (int j = 0; j < 16; ++j)
                     d_reg[j] = __float22bfloat162_rn(tmp[j]);
+            };
+            // Stages one BF16 chunk in a double-buffered tile and stores it to the BF16 output
+            auto store_bf16_chunk = [&](int i, const bf16_2 (&d_reg)[16]) {
                 warpgroup::sync(1);
                 const uint32_t d_bf16_addr = static_cast<uint32_t>(__cvta_generic_to_shared(&d_bf16_smem[i % 2]));
                 const uint32_t *d_bf16_words = reinterpret_cast<const uint32_t *>(d_reg);
@@ -329,29 +331,88 @@ static __device__ __forceinline__ void expert_grouped_gemm_kernel(
                                __uint_as_float(d_bf16_words[j * 4 + 2]), __uint_as_float(d_bf16_words[j * 4 + 3])});
                 warpgroup::sync(1);
                 warpgroup::tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(d_gmem, d_bf16_smem[i % 2], {2 * tile_coord.x + cta_rank, NUM_MXFP8_BLOCKS * tile_coord.y + i});
-
-                // Wait for previous iteration's FP8 store to complete
-                warpgroup::tma::store_async_read_wait<1>();
-                warpgroup::sync(1);
-                uint32_t d_fp8[8];
-                uint32_t d_scale_byte;
-                mxfp8::quantize_single_block(d_reg, d_fp8, d_scale_byte);
-                scale_word |= d_scale_byte << ((i % 4) * 8);
-                const uint32_t d_fp8_addr = static_cast<uint32_t>(__cvta_generic_to_shared(&d_fp8_smem));
+            };
+            // Writes one quantized chunk into an FP8 staging tile
+            auto stage_fp8_chunk = [&](mlp_fp8_d_tile &stage, const uint32_t (&d_fp8)[8]) {
+                const uint32_t d_fp8_addr = static_cast<uint32_t>(__cvta_generic_to_shared(&stage));
                 #pragma unroll
                 for (int m = 0; m < 2; ++m) {
                     move<float4>::sts(mlp_fp8_d_tile::idx(d_fp8_addr, {tile_row, m * 16}),
                         float4{__uint_as_float(d_fp8[m * 4]), __uint_as_float(d_fp8[m * 4 + 1]), __uint_as_float(d_fp8[m * 4 + 2]), __uint_as_float(d_fp8[m * 4 + 3])});
                 }
-                if (i % 4 == 3) {
-                    move<int>::sts(static_cast<uint32_t>(__cvta_generic_to_shared(&d_sc_smem[i / 4])) + (tile_row % 32) * 16 + (tile_row / 32) * 4, std::bit_cast<int>(scale_word));
-                    scale_word = 0;
+            };
+            // Writes this thread's 4 scale bytes (one per 32-column chunk of a 128-column block) into a scale tile
+            auto stage_scale_word = [&](int sc_idx, uint32_t scale_word) {
+                move<int>::sts(static_cast<uint32_t>(__cvta_generic_to_shared(&d_sc_smem[sc_idx])) + (tile_row % 32) * 16 + (tile_row / 32) * 4, std::bit_cast<int>(scale_word));
+            };
+
+            if constexpr (QUANT_BLOCK_SIZE == 32) {
+                // MXFP8: every 32-column chunk carries its own scale
+                uint32_t scale_word = 0;
+                #pragma unroll 1
+                for (int i = 0; i < NUM_MXFP8_BLOCKS; ++i) {
+                    bf16_2 d_reg[16];
+                    load_chunk(i, d_reg);
+                    store_bf16_chunk(i, d_reg);
+
+                    // Wait for previous iteration's FP8 store to complete
+                    warpgroup::tma::store_async_read_wait<1>();
+                    warpgroup::sync(1);
+                    uint32_t d_fp8[8];
+                    uint32_t d_scale_byte;
+                    mxfp8::quantize_single_block(d_reg, d_fp8, d_scale_byte);
+                    scale_word |= d_scale_byte << ((i % 4) * 8);
+                    stage_fp8_chunk(d_fp8_smem, d_fp8);
+                    if (i % 4 == 3) {
+                        stage_scale_word(i / 4, scale_word);
+                        scale_word = 0;
+                    }
+                    warpgroup::sync(1);
+                    if (warpgroup::laneid() == 0) {
+                        tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(*d_routed_gmem, d_fp8_smem, {2 * tile_coord.x + cta_rank, NUM_MXFP8_BLOCKS * tile_coord.y + i});
+                        if (i % 4 == 3)
+                            tma::store_async(*d_sc_gmem, d_sc_smem[i / 4], {2 * tile_coord.x + cta_rank, 2 * tile_coord.y + i / 4, 0, 0});
+                    }
                 }
-                warpgroup::sync(1);
-                if (warpgroup::laneid() == 0) {
-                    tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(*d_routed_gmem, d_fp8_smem, {2 * tile_coord.x + cta_rank, NUM_MXFP8_BLOCKS * tile_coord.y + i});
-                    if (i % 4 == 3)
-                        tma::store_async(*d_sc_gmem, d_sc_smem[i / 4], {2 * tile_coord.x + cta_rank, 2 * tile_coord.y + i / 4, 0, 0});
+            } else {
+                // Blockwise FP8: one scale per 128 output columns, so the 4 chunks of a block are loaded (and their BF16
+                // copies stored) before any of them is quantized. The FP8 chunks then reuse the two BF16 staging tiles,
+                // whose stores have been read by the time they are overwritten (at most one bulk store group stays pending).
+                constexpr int CHUNKS_PER_BLOCK = QUANT_BLOCK_SIZE / 32;
+                #pragma unroll 1
+                for (int g = 0; g < NUM_MXFP8_BLOCKS / CHUNKS_PER_BLOCK; ++g) {
+                    bf16_2 d_reg[CHUNKS_PER_BLOCK][16];
+                    #pragma unroll
+                    for (int c = 0; c < CHUNKS_PER_BLOCK; ++c) {
+                        load_chunk(g * CHUNKS_PER_BLOCK + c, d_reg[c]);
+                        store_bf16_chunk(g * CHUNKS_PER_BLOCK + c, d_reg[c]);
+                        warpgroup::tma::store_async_read_wait<1>();
+                        warpgroup::sync(1);
+                    }
+                    bf16_2 amax = mxfp8::block_amax(d_reg[0]);
+                    #pragma unroll
+                    for (int c = 1; c < CHUNKS_PER_BLOCK; ++c)
+                        amax = __hmax2(amax, mxfp8::block_amax(d_reg[c]));
+                    const uint32_t d_scale_byte = mxfp8::scale_byte_from_amax(mxfp8::amax_to_float(amax));
+                    const float d_scale_inv = mxfp8::scale_inv_from_byte(d_scale_byte);
+                    #pragma unroll
+                    for (int c = 0; c < CHUNKS_PER_BLOCK; ++c) {
+                        const int i = g * CHUNKS_PER_BLOCK + c;
+                        auto &d_fp8_stage = *reinterpret_cast<mlp_fp8_d_tile *>(&d_bf16_smem[c % 2]);
+                        uint32_t d_fp8[8];
+                        mxfp8::quantize_block_with_scale(d_reg[c], d_fp8, d_scale_inv);
+                        stage_fp8_chunk(d_fp8_stage, d_fp8);
+                        if (c == CHUNKS_PER_BLOCK - 1)
+                            stage_scale_word(g, mxfp8::replicate_scale_byte(d_scale_byte));
+                        warpgroup::sync(1);
+                        if (warpgroup::laneid() == 0) {
+                            tma::store_async<dim::ROW, cache_policy::EVICT_FIRST>(*d_routed_gmem, d_fp8_stage, {2 * tile_coord.x + cta_rank, NUM_MXFP8_BLOCKS * tile_coord.y + i});
+                            if (c == CHUNKS_PER_BLOCK - 1)
+                                tma::store_async(*d_sc_gmem, d_sc_smem[g], {2 * tile_coord.x + cta_rank, 2 * tile_coord.y + g, 0, 0});
+                        }
+                        warpgroup::tma::store_async_read_wait<1>();
+                        warpgroup::sync(1);
+                    }
                 }
             }
             tensor_before_thread_sync();

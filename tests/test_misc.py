@@ -1,5 +1,6 @@
 """Miscellaneous tests that we let AI agents freely add."""
 
+import dataclasses
 import math
 from collections.abc import Callable
 
@@ -17,8 +18,10 @@ from .utils import (
 
 BF16_TOLERANCE = (0.5, 0.01)
 MXFP8_TOLERANCE = (1.0, 0.1)
+BLOCKWISE_FP8_TOLERANCE = (1.0, 0.1)
 BF16_GRADIENT_MIN_COSINE = 0.9999
 MXFP8_GRADIENT_MIN_COSINE = 0.996
+BLOCKWISE_FP8_GRADIENT_MIN_COSINE = 0.99  # coarser 1x128 / 128x128 blocks than MXFP8's 1x32
 RESULT_NAMES = (
     "output",
     "d_x",
@@ -287,6 +290,87 @@ def _run_e2e_case(
             actual = (output, *gradients)
             tolerance = MXFP8_TOLERANCE
             gradient_min_cosine = MXFP8_GRADIENT_MIN_COSINE
+        elif precision == "blockwise":
+            blockwise_config = dataclasses.replace(config, fp8_recipe="blockwise")
+            (
+                w_routed_gate_fp8,
+                w_routed_gate_sc,
+                w_routed_gate_t_fp8,
+                w_routed_gate_t_sc,
+            ) = ops.blockwise_fp8_quantize(w_routed_gate, True, True, 128)
+            (
+                w_routed_up_fp8,
+                w_routed_up_sc,
+                w_routed_up_t_fp8,
+                w_routed_up_t_sc,
+            ) = ops.blockwise_fp8_quantize(w_routed_up, True, True, 128)
+            (
+                w_routed_down_fp8,
+                w_routed_down_sc,
+                w_routed_down_t_fp8,
+                w_routed_down_t_sc,
+            ) = ops.blockwise_fp8_quantize(w_routed_down, True, True, 128)
+            assert all(
+                tensor is not None
+                for tensor in (
+                    w_routed_gate_fp8,
+                    w_routed_gate_sc,
+                    w_routed_gate_t_fp8,
+                    w_routed_gate_t_sc,
+                    w_routed_up_fp8,
+                    w_routed_up_sc,
+                    w_routed_up_t_fp8,
+                    w_routed_up_t_sc,
+                    w_routed_down_fp8,
+                    w_routed_down_sc,
+                    w_routed_down_t_fp8,
+                    w_routed_down_t_sc,
+                )
+            )
+            output, forward_context = functional.forward(
+                blockwise_config,
+                workspace,
+                schedule,
+                x,
+                router_weights,
+                w_shared_gate,
+                w_shared_up,
+                w_shared_down,
+                (w_routed_gate_fp8, w_routed_gate_sc),
+                (w_routed_up_fp8, w_routed_up_sc),
+                (w_routed_down_fp8, w_routed_down_sc),
+            )
+            gradients = functional.backward(
+                blockwise_config,
+                workspace,
+                schedule,
+                forward_context,
+                d_output,
+                x,
+                router_weights,
+                w_shared_gate,
+                w_shared_up,
+                w_shared_down,
+                (
+                    w_routed_gate_fp8,
+                    w_routed_gate_sc,
+                    w_routed_gate_t_fp8,
+                    w_routed_gate_t_sc,
+                ),
+                (
+                    w_routed_up_fp8,
+                    w_routed_up_sc,
+                    w_routed_up_t_fp8,
+                    w_routed_up_t_sc,
+                ),
+                (
+                    w_routed_down_t_fp8,
+                    w_routed_down_t_sc,
+                ),
+            )
+            actual = (output, *gradients)
+            tolerance = BLOCKWISE_FP8_TOLERANCE
+            gradient_min_cosine = BLOCKWISE_FP8_GRADIENT_MIN_COSINE
         else:
             raise AssertionError(f"unsupported precision {precision!r}")
         for result_name, expected, result in zip(
@@ -534,7 +618,7 @@ def test_ep1_on_each_rank(
             num_local_experts=1,
             topk=1,
             config=config,
-            precisions=("bf16", "mxfp8"),
+            precisions=("bf16", "mxfp8", "blockwise"),
             group=ep_group,
         )
     finally:
@@ -563,7 +647,7 @@ def test_e2e_fixed_first_topk_experts_default_capacity(
                 minibatch_size=256,
                 macrobatch_size=512,
             ),
-            precisions=("bf16", "mxfp8"),
+            precisions=("bf16", "mxfp8", "blockwise"),
             top_experts=torch.arange(
                 topk,
                 device=device,
@@ -1897,7 +1981,7 @@ def test_e2e_different_topk(
                     minibatch_size=256,
                     macrobatch_size=512,
                 ),
-                precisions=("bf16", "mxfp8"),
+                precisions=("bf16", "mxfp8", "blockwise"),
             )
     finally:
         functional.clear_workspace_cache()

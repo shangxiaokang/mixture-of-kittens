@@ -396,3 +396,22 @@ def _bwd_epilogue_fake(
     d_x_routed_buffer: torch.Tensor,
 ) -> torch.Tensor:  # d_x
     return d_x_shared.new_empty(d_x_shared.shape)
+
+
+@torch.library.register_fake("mok::blockwise_fp8_quantize")
+def _blockwise_fp8_quantize_fake(
+    x_bf16: torch.Tensor,
+    return_normal: bool,
+    return_transposed: bool,
+    block_rows: int,
+) -> tuple[
+    torch.Tensor | None, torch.Tensor | None,  # x_fp8, x_sc
+    torch.Tensor | None, torch.Tensor | None,  # x_fp8_t, x_sc_t
+]:
+    return _mxfp8_quantize_fake(x_bf16, return_normal, return_transposed)
+
+
+# The blockwise FP8 megakernel ops produce exactly the MXFP8 tensors (shapes, dtypes and scale layouts)
+torch.library.register_fake("mok::dispatch_mlp_swiglu_combine_fwd_blockwise_fp8")(_dispatch_mlp_swiglu_combine_fwd_mxfp8_fake)
+torch.library.register_fake("mok::recompute_forward_context_blockwise_fp8")(_recompute_forward_context_mxfp8_fake)
+torch.library.register_fake("mok::dispatch_mlp_swiglu_combine_bwd_blockwise_fp8")(_dispatch_mlp_swiglu_combine_bwd_mxfp8_fake)

@@ -9,6 +9,7 @@ from mok.functional import get_workspace
 from mok.ops import (
     all_gather_top_experts,
     barrier_all,
+    blockwise_fp8_quantize,
     bwd_epilogue,
     dispatch_mlp_swiglu_combine_bwd_mxfp8,
     dispatch_mlp_swiglu_combine_bwd_bf16,
@@ -28,6 +29,7 @@ from .utils import (
     mok_params,
     swiglu_params,
     run_all_gather_top_experts_reference,
+    run_blockwise_fp8_quantize_reference,
     run_bwd_epilogue_reference,
     run_forward_reference_bf16,
     run_fwd_epilogue_reference,
@@ -330,6 +332,98 @@ def test_mxfp8_quantize(context: tuple[int, int, torch.device]) -> None:
     ):
         try:
             mxfp8_quantize(x, return_normal, return_transposed)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"{failure_name} should have failed")
+
+
+def test_blockwise_fp8_quantize(context: tuple[int, int, torch.device]) -> None:
+    rank, world_size, device = context
+    for block_rows, shape in itertools.product((1, 128), shapes(world_size)):
+        shape_name, num_experts, hidden_dim, intermediate_dim, _, num_local_tokens = shape
+        assert num_experts % world_size == 0
+        num_local_experts = num_experts // world_size
+        generator = torch.Generator(device=device).manual_seed(1234 + rank)
+        input_shapes = (
+            ("2D", (num_local_tokens, hidden_dim)),
+            ("3D", (num_local_experts, intermediate_dim, hidden_dim)),
+        )
+        for input_name, input_shape in input_shapes:
+            x_bf16 = torch.randn(
+                input_shape,
+                generator=generator,
+                device=device,
+                dtype=torch.bfloat16,
+            )
+            actual = blockwise_fp8_quantize(x_bf16, True, True, block_rows)
+            reference = run_blockwise_fp8_quantize_reference(x_bf16, True, True, block_rows)
+            for name, expected, result in zip(
+                MXFP8_RESULT_NAMES, reference, actual, strict=True
+            ):
+                assert expected is not None
+                assert result is not None
+                if expected.dtype == torch.float8_e4m3fn:
+                    expected = expected.view(torch.uint8)
+                    result = result.view(torch.uint8)
+                check_correctness(
+                    f"blockwise-{block_rows}x128/{shape_name}/{input_name}/{name}",
+                    expected,
+                    result,
+                    EXACT_TOLERANCE,
+                    print_stats=rank == 0,
+                )
+
+    generator = torch.Generator(device=device).manual_seed(5678 + rank)
+    x_bf16 = torch.randn(
+        128, 128, generator=generator, device=device, dtype=torch.bfloat16)
+    for (layout_name, return_normal, return_transposed), block_rows in itertools.product((
+        ("Normal only", True, False),
+        ("Transposed only", False, True),
+    ), (1, 128)):
+        actual = blockwise_fp8_quantize(
+            x_bf16, return_normal, return_transposed, block_rows)
+        reference = run_blockwise_fp8_quantize_reference(
+            x_bf16, return_normal, return_transposed, block_rows)
+        for name, expected, result in zip(
+            MXFP8_RESULT_NAMES, reference, actual, strict=True
+        ):
+            if expected is None:
+                assert result is None
+                continue
+            assert result is not None
+            if expected.dtype == torch.float8_e4m3fn:
+                expected = expected.view(torch.uint8)
+                result = result.view(torch.uint8)
+            check_correctness(
+                f"blockwise-{block_rows}x128/{layout_name}/{name}",
+                expected,
+                result,
+                EXACT_TOLERANCE,
+                print_stats=rank == 0,
+            )
+
+    for failure_name, x, return_normal, return_transposed, block_rows in (
+        ("input rank", x_bf16.flatten(), True, True, 1),
+        (
+            "row divisibility",
+            torch.randn(127, 128, device=device, dtype=torch.bfloat16),
+            True,
+            True,
+            1,
+        ),
+        (
+            "column divisibility",
+            torch.randn(128, 127, device=device, dtype=torch.bfloat16),
+            True,
+            True,
+            128,
+        ),
+        ("missing layout", x_bf16, False, False, 1),
+        ("block rows", x_bf16, True, True, 32),
+    ):
+        try:
+            blockwise_fp8_quantize(x, return_normal, return_transposed, block_rows)
         except ValueError:
             pass
         else:
