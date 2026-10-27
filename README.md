@@ -68,6 +68,11 @@ pip install -e . --no-build-isolation
 make
 ```
 
+`make EXTRA_NVCCFLAGS=-DMOK_SINGLE_NODE` compiles only the single-node EP sizes (1, 4, 8), which roughly halves the
+build time. Adding `-DMOK_PROFILE` instruments the megakernels with per-stage timers (dispatch, combine, each GEMM,
+SwiGLU and their quantization phases; see `csrc/megakernel/profile.cuh`). Reset the timers with
+`mok.ops._C.profile_reset()` and read them with `mok.ops._C.profile_read()`; without the flag no timing code is generated.
+
 #### Unit tests
 
 Launch multi-GPU unit tests through `torchrun` and `pytest`:
@@ -105,6 +110,14 @@ MoK relies on PyTorch symmetric memory to allocate and manage inter-GPU symmetri
 
 Because symmetric buffers are expensive to allocate, we recommend creating a single workspace per model and reusing it across layers. For this, we provide the `get_workspace(...)` function, which automatically caches workspaces with identical properties (EP group, device, model shapes, etc.). If you prefer to manage a workspace's lifetime yourself, the `create_workspace(...)` function does not cache.
 
+### Shapes
+
+`hidden_size` must be a multiple of 256 and `intermediate_size` a multiple of 128: the grouped GEMMs use 256x256
+output tiles, and an `intermediate_size` such as 640 (Qwen3.8-Flash-Next) ends in a half-width, 128-column tile
+that the kernel computes with an N=128 tensor-core MMA. Weight gradients whose rows are the intermediate dim
+(`d_w_*_gate`, `d_w_*_up`) are then computed with swapped operands and stored transposed by the GEMM epilogue, so
+their layout and cost are unchanged.
+
 ### MXFP8
 
 To run MoK in MXFP8 mode, pass the activations as-is in BF16 while prequantizing the weights to MXFP8. We *could* quantize the weights inside our kernels, but prequantizing leaves better opportunities for things like FSDP, so we keep it separate and provide the `mxfp8_quantize(...)` function at the ops layer so you can prequantize the weights yourself.
@@ -121,6 +134,18 @@ To use it, set `fp8_recipe="blockwise"` in the `MoKConfig`, prequantize the rout
 `ops.blockwise_fp8_quantize(w, True, True, 128)` instead of `ops.mxfp8_quantize(w, True, True)`, and otherwise call the
 functional API exactly as in the MXFP8 example below. `ops.blockwise_fp8_quantize(x, ..., 1)` exposes the 1x128
 activation quantizer. Because the blocks are coarser than MXFP8's, expect slightly larger quantization error.
+
+### Gated shared expert
+
+The shared expert is mandatory and ungated by default (`output = shared(x) + sum_k w_k routed_k(x)`). Models such as
+Qwen3.8-Flash-Next scale it per token with a gate `g = sigmoid(x @ v)`. MoK takes that gate as a float32
+`[num_local_tokens]` tensor: `functional.forward(..., shared_gate=g)` applies it in the forward epilogue
+(`output = g[:, None] * shared(x) + routed`), and `forward_context.y_shared` holds the ungated shared-expert output so the
+caller can form the gate's gradient with `functional.shared_gate_backward(d_output, forward_context.y_shared)`
+(`= (d_output * y_shared).sum(-1)`; the gate's own `d_x`/`d_v` terms, e.g. through the sigmoid and `v`, are the
+caller's). The backward takes the output gradient as seen by the shared expert separately:
+`functional.backward(..., d_y_shared=(g[:, None] * d_output).bfloat16())` feeds the shared expert's dgrad/wgrad GEMMs
+while the routed path keeps `d_output`. Without a gate (`shared_gate=None`, `d_y_shared=None`) nothing changes.
 
 ### Example (MXFP8 forward and backward using the functional layer)
 

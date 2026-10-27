@@ -1,7 +1,11 @@
 template <bool IS_CLAMPED>
 static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(const globals_bwd &g) {
     const int num_local_experts = g.w_routed_gate.depth();
-    const int intermediate_dim_col_blocks = g.hidden_shared.cols() / config::MLP_Nb;
+    const int intermediate_dim_col_blocks = ceil_div(g.hidden_shared.cols(), config::MLP_Nb);
+    // Gate/up wgrads have M = I. Only N supports a half-width (MLP_Nb / 2) tail tile, so when I is not a multiple of
+    // MLP_Nb they are computed as d_w^T (H, I) = x^T @ d_gate by swapping the GEMM operands, and the GEMM epilogue
+    // stores the (H, I) tiles transposed into the (I, H) gradient.
+    const bool transpose_gate_up_wgrad = g.hidden_shared.cols() % config::MLP_Nb != 0;
     const int hidden_dim_col_blocks = g.d_y_shared.cols() / config::MLP_Nb;
 
     int cluster_idx = clusterIdx().x;
@@ -130,32 +134,40 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
     if (cluster_idx < comm_clusters) {
         const int comm_cta_idx = cluster_idx * config::CLUSTER_SIZE + cta_rank;
         auto reverse_combine = [&](int macrobatch_idx, int task_idx) {
+            MOK_PROFILE_START(task_start);
             dispatch_kernel<true>(g.d_y_buffer, g.d_y_fp8_routed, &g.d_y_sc_routed, &g.d_y_fp8_t_routed, &g.d_y_sc_t_routed,
                                      &g.router_weights, g.schedule_peer_rank, g.schedule_peer_token_idx,
                                      nullptr, nullptr, g.d_y_routed_ready,
                                      dispatch_inputs_arrived, dispatch_bitfield,
                                      num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx, task_idx, g.topk,
                                      -1, 0, smem_base_addr);
+            MOK_PROFILE_END(task_start, mok_profile::B_REV_COMBINE);
         };
         auto reverse_dispatch = [&](int macrobatch_idx, int task_idx) {
+            MOK_PROFILE_START(task_start);
             combine_kernel(g.d_x_routed_buffer, g.d_x_routed, &g.d_router_weight_buffer, &g.d_router_weight_partials,
                            g.schedule_peer_rank, g.schedule_peer_token_idx,
                            g.d_x_routed_ready, num_macrobatches > 1 ? &g.routed_buffers_done : nullptr,
                            combine_inputs_arrived, combine_bitfield,
                            num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx, task_idx, smem_base_addr);
+            MOK_PROFILE_END(task_start, mok_profile::B_REV_DISPATCH);
         };
         auto replay_dispatch = [&](int macrobatch_idx, int task_idx) {
-            dispatch_kernel<false>(g.x_routed_send_buffer, g.x_fp8_routed, &g.x_sc_routed, &g.x_fp8_t_routed, &g.x_sc_t_routed,
+            MOK_PROFILE_START(task_start);
+            dispatch_kernel<false, true>(g.x_routed_send_buffer, g.x_fp8_routed, &g.x_sc_routed, &g.x_fp8_t_routed, &g.x_sc_t_routed,
                                      nullptr, g.schedule_peer_rank, g.schedule_peer_token_idx,
                                      nullptr, nullptr, g.replayed_x_routed_ready,
                                      dispatch_inputs_arrived, dispatch_bitfield,
                                      num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx, task_idx, g.topk,
                                      -1, 0, smem_base_addr);
+            MOK_PROFILE_END(task_start, mok_profile::B_REPLAY_DISPATCH);
         };
+        MOK_PROFILE_START(preload_start);
         preload_router_weights_kernel(g.router_weight_buffer, g.router_weights,
                                       g.schedule_peer_rank, g.schedule_peer_token_idx,
                                       nullptr, g.router_weights_ready,
                                       num_tokens, macrobatch_size, 0, comm_cta_idx, g.num_comm_sms, -1, 0);
+        MOK_PROFILE_END(preload_start, mok_profile::B_PRELOAD);
         for (int task_idx = comm_cta_idx; task_idx < num_dispatch_tasks_of(0); task_idx += g.num_comm_sms)
             reverse_combine(0, task_idx);
         for (int macrobatch_idx = 0; macrobatch_idx < num_macrobatches; ++macrobatch_idx) {
@@ -221,6 +233,8 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
 
         const int compute_cluster_idx = cluster_idx - comm_clusters;
         const bool current_is_cta_local = is_cta_local_task(compute_cluster_idx);
+        MOK_PROFILE_START(task_start);
+        [[maybe_unused]] int profile_stage = mok_profile::B_SHARED;
 
         if (compute_cluster_idx < shared_dgrad_down_tasks) {
             // Shared dgrad down: d_hidden_shared = d_y_shared @ w_shared_down
@@ -266,23 +280,27 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
         } else if (compute_cluster_idx < shared_tasks - shared_wgrad_tasks) {
             // Shared wgrad gate: d_w_shared_gate += d_gate_shared^T @ x_shared
             const int task_idx = compute_cluster_idx - shared_dgrad_down_tasks - shared_swiglu_bwd_tasks - shared_dgrad_gate_up_tasks - shared_wgrad_tasks;
-            expert_grouped_gemm_kernel<true, true>(g.d_gate_shared, g.x_shared, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+            expert_grouped_gemm_kernel<true, true>(transpose_gate_up_wgrad ? g.x_shared : g.d_gate_shared,
+                                            transpose_gate_up_wgrad ? g.d_gate_shared : g.x_shared,
+                                            nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
                                             g.d_w_shared_gate, nullptr, nullptr,
                                             g.tokens_per_expert, nullptr, &g.d_gate_up_ready, nullptr, nullptr, nullptr, nullptr,
                                             d_tt, a_sc_tt, b_sc_tt,
                                             gemm_inputs_arrived, gemm_scales_arrived, gemm_inputs_finished, gemm_scales_finished, gemm_outputs_arrived, gemm_outputs_finished, gemm_bitfield,
                                             num_tokens, macrobatch_size, g.minibatch_size, 0, 0, task_idx, cta_rank,
-                                            0, 0, d_gate_up_row_block_ready_required_count, 0, 0, smem_base_addr);
+                                            0, 0, d_gate_up_row_block_ready_required_count, 0, 0, smem_base_addr, transpose_gate_up_wgrad);
         } else if (compute_cluster_idx < shared_tasks) {
             // Shared wgrad up: d_w_shared_up += d_up_shared^T @ x_shared
             const int task_idx = compute_cluster_idx - shared_dgrad_down_tasks - shared_swiglu_bwd_tasks - shared_dgrad_gate_up_tasks - 2 * shared_wgrad_tasks;
-            expert_grouped_gemm_kernel<true, true>(g.d_up_shared, g.x_shared, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+            expert_grouped_gemm_kernel<true, true>(transpose_gate_up_wgrad ? g.x_shared : g.d_up_shared,
+                                            transpose_gate_up_wgrad ? g.d_up_shared : g.x_shared,
+                                            nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
                                             g.d_w_shared_up, nullptr, nullptr,
                                             g.tokens_per_expert, nullptr, &g.d_gate_up_ready, nullptr, nullptr, nullptr, nullptr,
                                             d_tt, a_sc_tt, b_sc_tt,
                                             gemm_inputs_arrived, gemm_scales_arrived, gemm_inputs_finished, gemm_scales_finished, gemm_outputs_arrived, gemm_outputs_finished, gemm_bitfield,
                                             num_tokens, macrobatch_size, g.minibatch_size, 0, 0, task_idx, cta_rank,
-                                            0, 0, d_gate_up_row_block_ready_required_count, 0, 0, smem_base_addr);
+                                            0, 0, d_gate_up_row_block_ready_required_count, 0, 0, smem_base_addr, transpose_gate_up_wgrad);
         } else {
             // Routed / replay tasks
             const int global_routed_task_idx = compute_cluster_idx - shared_tasks;
@@ -299,6 +317,7 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
                 if (minibatch_task_idx < minibatch_routed_gate_up_tasks) {
                     // Replay gate GEMM refreshes the routed activation.
                     const int task_idx = minibatch_task_idx;
+                    profile_stage = mok_profile::B_REPLAY_GATE;
                     expert_grouped_gemm_kernel<false>(g.x_fp8_routed, g.w_routed_gate, &g.x_sc_routed, &g.w_routed_gate_sc, nullptr, nullptr, nullptr, nullptr,
                                                g.gate_routed, &g.gate_fp8_routed, &g.gate_sc_routed,
                                                g.tokens_per_expert, &g.replayed_x_routed_ready, nullptr, nullptr, &g.replayed_gate_up_ready, nullptr, nullptr,
@@ -309,6 +328,7 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
                 } else if (minibatch_task_idx < minibatch_routed_gate_up_tasks * 2) {
                     // Replay up GEMM refreshes the routed activation.
                     const int task_idx = minibatch_task_idx - minibatch_routed_gate_up_tasks;
+                    profile_stage = mok_profile::B_REPLAY_UP;
                     expert_grouped_gemm_kernel<false>(g.x_fp8_routed, g.w_routed_up, &g.x_sc_routed, &g.w_routed_up_sc, nullptr, nullptr, nullptr, nullptr,
                                                g.up_routed, &g.up_fp8_routed, &g.up_sc_routed,
                                                g.tokens_per_expert, &g.replayed_x_routed_ready, nullptr, nullptr, &g.replayed_gate_up_ready, nullptr, nullptr,
@@ -319,7 +339,8 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
                 } else {
                     // Replay Swiglu refreshes the routed hidden activation.
                     const int task_idx = minibatch_task_idx - minibatch_routed_gate_up_tasks * 2;
-                    swiglu_fwd_kernel<false, IS_CLAMPED>(g.gate_routed, g.up_routed, g.hidden_fp8_routed,
+                    profile_stage = mok_profile::B_REPLAY_SWIGLU;
+                    swiglu_fwd_kernel<false, IS_CLAMPED, true>(g.gate_routed, g.up_routed, g.hidden_fp8_routed,
                                       &g.hidden_sc_routed, &g.hidden_fp8_t_routed, &g.hidden_sc_t_routed,
                                       g.replayed_gate_up_ready, g.replayed_hidden_ready,
                                       swiglu_fwd_inputs_arrived, swiglu_fwd_bitfield,
@@ -335,6 +356,7 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
                 if (routed_task_idx < num_routed_tasks && minibatch_task_idx < minibatch_routed_dgrad_down_tasks) {
                     // Dgrad down: d_hidden_routed = d_y_routed @ w_routed_down
                     const int task_idx = minibatch_task_idx;
+                    profile_stage = mok_profile::B_DGRAD_DOWN;
                     expert_grouped_gemm_kernel<false, false, !USE_MXFP8>(g.d_y_fp8_routed, g.w_routed_down_T, &g.d_y_sc_routed, &g.w_routed_down_T_sc, nullptr, nullptr, nullptr, nullptr,
                                                g.d_hidden_routed, nullptr, nullptr,
                                                g.tokens_per_expert, &g.d_y_routed_ready, nullptr, nullptr, &g.d_hidden_ready, nullptr, buffer_done,
@@ -346,6 +368,7 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
                            minibatch_task_idx < minibatch_routed_dgrad_down_tasks + minibatch_routed_swiglu_bwd_tasks) {
                     // Routed Swiglu backward
                     const int task_idx = minibatch_task_idx - minibatch_routed_dgrad_down_tasks;
+                    profile_stage = mok_profile::B_SWIGLU_BWD;
                     swiglu_bwd_kernel<false, IS_CLAMPED>(g.d_hidden_routed, g.gate_fp8_routed, g.up_fp8_routed, g.d_gate_fp8_routed, g.d_up_fp8_routed,
                                       &g.gate_sc_routed, &g.up_sc_routed, &g.d_gate_sc_routed, &g.d_up_sc_routed,
                                       &g.d_gate_fp8_t_routed, &g.d_gate_sc_t_routed, &g.d_up_fp8_t_routed, &g.d_up_sc_t_routed,
@@ -358,6 +381,7 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
                 } else if (routed_task_idx < num_routed_tasks) {
                     // Dgrad gate+up: d_x_routed = d_gate @ w_routed_gate + d_up @ w_routed_up
                     const int task_idx = minibatch_task_idx - minibatch_routed_dgrad_down_tasks - minibatch_routed_swiglu_bwd_tasks;
+                    profile_stage = mok_profile::B_DGRAD_GATE_UP;
                     expert_grouped_gemm_kernel<false, false, !USE_MXFP8>(g.d_gate_fp8_routed, g.w_routed_gate_T, &g.d_gate_sc_routed, &g.w_routed_gate_T_sc,
                                                &g.d_up_fp8_routed, &g.w_routed_up_T, &g.d_up_sc_routed, &g.w_routed_up_T_sc,
                                                g.d_x_routed, nullptr, nullptr,
@@ -369,6 +393,7 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
                 } else if (routed_task_idx < num_routed_tasks + wgrad_matrix_tasks) {
                     // Wgrad down: d_w_routed_down += d_y_routed^T @ hidden_routed
                     const int task_idx = routed_task_idx - num_routed_tasks;
+                    profile_stage = mok_profile::B_WGRAD_DOWN;
                     expert_grouped_gemm_kernel<false, true>(g.d_y_fp8_t_routed, g.hidden_fp8_t_routed, &g.d_y_sc_t_routed, &g.hidden_sc_t_routed, nullptr, nullptr, nullptr, nullptr,
                                                      g.d_w_routed_down, nullptr, nullptr,
                                                      g.tokens_per_expert, &g.d_y_routed_ready, replayed ? &g.replayed_hidden_ready : nullptr,
@@ -380,7 +405,12 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
                 } else if (routed_task_idx < num_routed_tasks + 2 * wgrad_matrix_tasks) {
                     // Wgrad gate: d_w_routed_gate += d_gate_routed^T @ x_routed
                     const int task_idx = routed_task_idx - num_routed_tasks - wgrad_matrix_tasks;
-                    expert_grouped_gemm_kernel<false, true>(g.d_gate_fp8_t_routed, g.x_fp8_t_routed, &g.d_gate_sc_t_routed, &g.x_sc_t_routed, nullptr, nullptr, nullptr, nullptr,
+                    profile_stage = mok_profile::B_WGRAD_GATE;
+                    expert_grouped_gemm_kernel<false, true>(transpose_gate_up_wgrad ? g.x_fp8_t_routed : g.d_gate_fp8_t_routed,
+                                                     transpose_gate_up_wgrad ? g.d_gate_fp8_t_routed : g.x_fp8_t_routed,
+                                                     transpose_gate_up_wgrad ? &g.x_sc_t_routed : &g.d_gate_sc_t_routed,
+                                                     transpose_gate_up_wgrad ? &g.d_gate_sc_t_routed : &g.x_sc_t_routed,
+                                                     nullptr, nullptr, nullptr, nullptr,
                                                      g.d_w_routed_gate, nullptr, nullptr,
                                                      g.tokens_per_expert, replayed ? &g.replayed_x_routed_ready : nullptr,
                                                      &g.d_gate_up_ready, nullptr, nullptr, nullptr, buffer_done,
@@ -388,11 +418,16 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
                                                      gemm_inputs_arrived, gemm_scales_arrived, gemm_inputs_finished, gemm_scales_finished, gemm_outputs_arrived, gemm_outputs_finished, gemm_bitfield,
                                                      num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx, 0, task_idx, cta_rank,
                                                      g.d_y_shared.cols(), shared_row_blocks, d_gate_up_row_block_ready_required_count,
-                                                     0, macrobatch_idx, smem_base_addr);
+                                                     0, macrobatch_idx, smem_base_addr, transpose_gate_up_wgrad);
                 } else {
                     // Wgrad up: d_w_routed_up += d_up_routed^T @ x_routed
                     const int task_idx = routed_task_idx - num_routed_tasks - 2 * wgrad_matrix_tasks;
-                    expert_grouped_gemm_kernel<false, true>(g.d_up_fp8_t_routed, g.x_fp8_t_routed, &g.d_up_sc_t_routed, &g.x_sc_t_routed, nullptr, nullptr, nullptr, nullptr,
+                    profile_stage = mok_profile::B_WGRAD_UP;
+                    expert_grouped_gemm_kernel<false, true>(transpose_gate_up_wgrad ? g.x_fp8_t_routed : g.d_up_fp8_t_routed,
+                                                     transpose_gate_up_wgrad ? g.d_up_fp8_t_routed : g.x_fp8_t_routed,
+                                                     transpose_gate_up_wgrad ? &g.x_sc_t_routed : &g.d_up_sc_t_routed,
+                                                     transpose_gate_up_wgrad ? &g.d_up_sc_t_routed : &g.x_sc_t_routed,
+                                                     nullptr, nullptr, nullptr, nullptr,
                                                      g.d_w_routed_up, nullptr, nullptr,
                                                      g.tokens_per_expert, replayed ? &g.replayed_x_routed_ready : nullptr,
                                                      &g.d_gate_up_ready, nullptr, nullptr, nullptr, buffer_done,
@@ -400,10 +435,11 @@ static __device__ __forceinline__ void dispatch_mlp_swiglu_combine_bwd_kernel(co
                                                      gemm_inputs_arrived, gemm_scales_arrived, gemm_inputs_finished, gemm_scales_finished, gemm_outputs_arrived, gemm_outputs_finished, gemm_bitfield,
                                                      num_tokens, macrobatch_size, g.minibatch_size, macrobatch_idx, 0, task_idx, cta_rank,
                                                      g.d_y_shared.cols(), shared_row_blocks, d_gate_up_row_block_ready_required_count,
-                                                     0, macrobatch_idx, smem_base_addr);
+                                                     0, macrobatch_idx, smem_base_addr, transpose_gate_up_wgrad);
                 }
             }
         }
+        MOK_PROFILE_END(task_start, profile_stage);
 
         wait(schedule_arrived[clc_stage], (task_iter / config::CLC_PIPE_DEPTH) % 2);
         const auto schedule = clc::query(clc_handle[clc_stage]);
@@ -447,8 +483,10 @@ static __host__ __forceinline__ std::tuple<at::Tensor, at::Tensor, at::Tensor, a
                                            at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 dispatch_mlp_swiglu_combine_bwd_mxfp8(
     // Symmetric buffers (input/output gradients and router weights)
-    const at::Tensor &d_y_buffer,               // (num_local_tokens, H)
+    const at::Tensor &d_y_buffer,               // (num_local_tokens, H) output gradient, pulled by the peers' reverse combine
     const std::vector<int64_t> &d_y_buffer_ptrs,
+    const at::Tensor &d_y_shared,               // (num_local_tokens, H) output gradient seen by the shared expert
+                                                // (= d_y_buffer, or shared_gate * d_y for a gated shared expert)
     const at::Tensor &d_x_routed_buffer,        // (num_local_tokens * topk, H)
     const std::vector<int64_t> &d_x_routed_buffer_ptrs,
     const at::Tensor &router_weight_buffer,     // (num_local_tokens, topk)
@@ -510,7 +548,7 @@ dispatch_mlp_swiglu_combine_bwd_mxfp8(
     const int num_macrobatches = (schedule_capacity + macrobatch_size - 1) / macrobatch_size;
     const int shared_row_blocks = num_local_tokens / config::MLP_Mb;
     const int routed_row_blocks = schedule_capacity / config::MLP_Mb;
-    const int intermediate_dim_col_blocks = intermediate_dim / config::MLP_Nb;
+    const int intermediate_dim_col_blocks = ceil_div(intermediate_dim, config::MLP_Nb);
 
     activation_bf16_pgl x_routed_send_buffer_data;
     activation_bf16_pgl d_y_buffer_data;
@@ -573,7 +611,7 @@ dispatch_mlp_swiglu_combine_bwd_mxfp8(
     at::Tensor router_weights_ready = at::zeros({num_macrobatches}, tokens_per_expert.options());
 
     globals_bwd g {
-        .x_shared = kittens::py::tensor_to_gl<wgrad_bf16_gl>(x),
+        .x_shared = kittens::py::tensor_to_gl<mlp_bf16_gl>(x),
         .x_fp8_routed = kittens::py::tensor_to_gl<mlp_fp8_gl>(x_fp8_routed),
         .x_sc_routed = kittens::py::tensor_to_gl<sc_gl>(x_sc_routed),
         .x_fp8_t_routed = kittens::py::tensor_to_gl<mlp_fp8_gl>(x_fp8_t_routed),
@@ -591,7 +629,7 @@ dispatch_mlp_swiglu_combine_bwd_mxfp8(
         .hidden_sc_routed = kittens::py::tensor_to_gl<sc_gl>(hidden_sc_routed),
         .hidden_fp8_t_routed = kittens::py::tensor_to_gl<mlp_fp8_gl>(hidden_fp8_t_routed),
         .hidden_sc_t_routed = kittens::py::tensor_to_gl<sc_gl>(hidden_sc_t_routed),
-        .d_y_shared = kittens::py::tensor_to_gl<mlp_bf16_gl>(d_y_buffer),
+        .d_y_shared = kittens::py::tensor_to_gl<mlp_bf16_gl>(d_y_shared),
         .d_y_fp8_routed = kittens::py::tensor_to_gl<mlp_fp8_gl>(d_y_fp8_routed),
         .d_y_sc_routed = kittens::py::tensor_to_gl<sc_gl>(d_y_sc_routed),
         .d_y_fp8_t_routed = kittens::py::tensor_to_gl<mlp_fp8_gl>(d_y_fp8_t_routed),
@@ -684,6 +722,7 @@ static __host__ __forceinline__ std::tuple<at::Tensor, at::Tensor, at::Tensor, a
 dispatch_mlp_swiglu_combine_bwd_bf16(
     const at::Tensor &d_y_buffer,
     const std::vector<int64_t> &d_y_buffer_ptrs,
+    const at::Tensor &d_y_shared,
     const at::Tensor &d_x_routed_buffer,
     const std::vector<int64_t> &d_x_routed_buffer_ptrs,
     const at::Tensor &router_weight_buffer,
@@ -725,7 +764,7 @@ dispatch_mlp_swiglu_combine_bwd_bf16(
     const int num_macrobatches = (schedule_capacity + macrobatch_size - 1) / macrobatch_size;
     const int shared_row_blocks = num_local_tokens / config::MLP_Mb;
     const int routed_row_blocks = schedule_capacity / config::MLP_Mb;
-    const int intermediate_dim_col_blocks = intermediate_dim / config::MLP_Nb;
+    const int intermediate_dim_col_blocks = ceil_div(intermediate_dim, config::MLP_Nb);
 
     activation_bf16_pgl x_routed_send_buffer_data;
     activation_bf16_pgl d_y_buffer_data;
@@ -769,7 +808,7 @@ dispatch_mlp_swiglu_combine_bwd_bf16(
     at::Tensor router_weights_ready = at::zeros({num_macrobatches}, tokens_per_expert.options());
 
     globals_bwd g {
-        .x_shared = kittens::py::tensor_to_gl<wgrad_bf16_gl>(x),
+        .x_shared = kittens::py::tensor_to_gl<mlp_bf16_gl>(x),
         .x_fp8_routed = kittens::py::tensor_to_gl<routed_activation_gl>(x_routed),
         .x_sc_routed = {},
         .x_fp8_t_routed = kittens::py::tensor_to_gl<routed_transposed_gl>(x_routed),
@@ -787,7 +826,7 @@ dispatch_mlp_swiglu_combine_bwd_bf16(
         .hidden_sc_routed = {},
         .hidden_fp8_t_routed = kittens::py::tensor_to_gl<routed_transposed_gl>(hidden_routed),
         .hidden_sc_t_routed = {},
-        .d_y_shared = kittens::py::tensor_to_gl<mlp_bf16_gl>(d_y_buffer),
+        .d_y_shared = kittens::py::tensor_to_gl<mlp_bf16_gl>(d_y_shared),
         .d_y_fp8_routed = kittens::py::tensor_to_gl<routed_activation_gl>(d_y_routed),
         .d_y_sc_routed = {},
         .d_y_fp8_t_routed = kittens::py::tensor_to_gl<routed_transposed_gl>(d_y_routed),

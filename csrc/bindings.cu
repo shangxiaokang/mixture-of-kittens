@@ -18,6 +18,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("blockwise_fp8_quantize", &mxfp8::blockwise_quantize_entrypoint, "",
           pybind11::arg("x_bf16"),
           pybind11::arg("return_normal"), pybind11::arg("return_transposed"), pybind11::arg("block_rows"));
+#ifdef MOK_PROFILE
+    m.def("profile_read", &mok_profile::read, "per-stage megakernel timing table (see csrc/megakernel/profile.cuh)");
+    m.def("profile_reset", &mok_profile::reset, "");
+#endif
     m.def("dispatch_mlp_swiglu_combine_fwd_mxfp8", &dispatch_mlp_swiglu_combine_fwd_fp8_entrypoint<RoutedPrecision::MXFP8>, "",
           pybind11::arg("x"), pybind11::arg("x_ptrs"),
           pybind11::arg("combine_buffer"), pybind11::arg("combine_buffer_ptrs"),
@@ -29,7 +33,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("topk"), pybind11::arg("swiglu_limit"),
           pybind11::arg("num_comm_sms"), pybind11::arg("macrobatch_size"), pybind11::arg("minibatch_size"));
     m.def("dispatch_mlp_swiglu_combine_bwd_mxfp8", &dispatch_mlp_swiglu_combine_bwd_fp8_entrypoint<RoutedPrecision::MXFP8>, "",
-          pybind11::arg("d_y_buffer"), pybind11::arg("d_y_buffer_ptrs"),
+          pybind11::arg("d_y_buffer"), pybind11::arg("d_y_buffer_ptrs"), pybind11::arg("d_y_shared"),
           pybind11::arg("d_x_routed_buffer"), pybind11::arg("d_x_routed_buffer_ptrs"),
           pybind11::arg("router_weight_buffer"), pybind11::arg("router_weight_buffer_ptrs"),
           pybind11::arg("d_router_weight_buffer"), pybind11::arg("d_router_weight_buffer_ptrs"),
@@ -58,7 +62,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("topk"), pybind11::arg("swiglu_limit"),
           pybind11::arg("num_comm_sms"), pybind11::arg("macrobatch_size"), pybind11::arg("minibatch_size"));
     m.def("dispatch_mlp_swiglu_combine_bwd_bf16", &dispatch_mlp_swiglu_combine_bwd_bf16_entrypoint, "",
-          pybind11::arg("d_y_buffer"), pybind11::arg("d_y_buffer_ptrs"),
+          pybind11::arg("d_y_buffer"), pybind11::arg("d_y_buffer_ptrs"), pybind11::arg("d_y_shared"),
           pybind11::arg("d_x_routed_buffer"), pybind11::arg("d_x_routed_buffer_ptrs"),
           pybind11::arg("router_weight_buffer"), pybind11::arg("router_weight_buffer_ptrs"),
           pybind11::arg("d_router_weight_buffer"), pybind11::arg("d_router_weight_buffer_ptrs"),
@@ -75,7 +79,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("topk"), pybind11::arg("swiglu_limit"),
           pybind11::arg("num_comm_sms"), pybind11::arg("macrobatch_size"), pybind11::arg("minibatch_size"));
     m.def("fwd_epilogue", &utils::fwd_epilogue::fwd_epilogue_entrypoint, "",
-          pybind11::arg("y_shared"), pybind11::arg("combine_buffer"), pybind11::arg("topk_weights"));
+          pybind11::arg("y_shared"), pybind11::arg("combine_buffer"), pybind11::arg("topk_weights"),
+          pybind11::arg("shared_gate"));
     m.def("bwd_epilogue", &utils::bwd_epilogue::bwd_epilogue_entrypoint, "",
           pybind11::arg("d_x_shared"), pybind11::arg("d_x_routed_buffer"));
     m.def("recompute_forward_context_mxfp8", &recompute_forward_context_fp8_entrypoint<RoutedPrecision::MXFP8>, "",
@@ -106,7 +111,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("topk"), pybind11::arg("swiglu_limit"),
           pybind11::arg("num_comm_sms"), pybind11::arg("macrobatch_size"), pybind11::arg("minibatch_size"));
     m.def("dispatch_mlp_swiglu_combine_bwd_blockwise_fp8", &dispatch_mlp_swiglu_combine_bwd_fp8_entrypoint<RoutedPrecision::BLOCKWISE_FP8>, "",
-          pybind11::arg("d_y_buffer"), pybind11::arg("d_y_buffer_ptrs"),
+          pybind11::arg("d_y_buffer"), pybind11::arg("d_y_buffer_ptrs"), pybind11::arg("d_y_shared"),
           pybind11::arg("d_x_routed_buffer"), pybind11::arg("d_x_routed_buffer_ptrs"),
           pybind11::arg("router_weight_buffer"), pybind11::arg("router_weight_buffer_ptrs"),
           pybind11::arg("d_router_weight_buffer"), pybind11::arg("d_router_weight_buffer_ptrs"),

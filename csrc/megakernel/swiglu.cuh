@@ -35,7 +35,8 @@ static __device__ __forceinline__ float2 swiglu_bwd_pair(
     return {silu.x * up.x, silu.y * up.y};
 }
 
-template <bool IS_SHARED, bool IS_CLAMPED>
+// REPLAY marks the backward's replay of the forward SwiGLU (profiling category only)
+template <bool IS_SHARED, bool IS_CLAMPED, bool REPLAY = false>
 static __device__ __forceinline__ void swiglu_fwd_kernel(
     const epi_bf16_gl &gate_gmem,
     const epi_bf16_gl &up_gmem,
@@ -66,7 +67,7 @@ static __device__ __forceinline__ void swiglu_fwd_kernel(
     auto (&up_smem)[config::SWIGLU_FWD_PIPE_DEPTH]   = *reinterpret_cast<input_bf16_tile (*)[config::SWIGLU_FWD_PIPE_DEPTH]>(reinterpret_cast<uint64_t>(&gate_smem) + sizeof(gate_smem));
     auto &hidden_smem                                = *reinterpret_cast<output_bf16_tile *>(reinterpret_cast<uint64_t>(&up_smem) + sizeof(up_smem));
 
-    const int intermediate_dim_col_blocks = hidden_gmem.cols() / config::MLP_Nb;
+    const int intermediate_dim_col_blocks = ceil_div(hidden_gmem.cols(), config::MLP_Nb);
     const int global_minibatch_idx = macrobatch_idx * (macrobatch_size / minibatch_size) + minibatch_idx;
     const int macrobatch_row_block_offset = macrobatch_idx * (macrobatch_size / config::SWIGLU_Mb);
 
@@ -119,6 +120,7 @@ static __device__ __forceinline__ void swiglu_fwd_kernel(
         if (tile_idx < tile_end) {
             wait(swiglu_inputs_arrived[stage], get_phasebit<0>(swiglu_bitfield, stage));
             update_phasebit<0>(swiglu_bitfield, stage);
+            MOK_PROFILE_START(compute_start);
 
             // This improves throughput
             int row = first_row;
@@ -166,6 +168,8 @@ static __device__ __forceinline__ void swiglu_fwd_kernel(
                 }
             }
             __syncthreads();
+            if constexpr (USE_ROUTED_MXFP8) MOK_PROFILE_END(compute_start, REPLAY ? mok_profile::B_REPLAY_SWIGLU_COMPUTE : mok_profile::F_SWIGLU_COMPUTE);
+            MOK_PROFILE_START(quant_start);
 
             if constexpr (USE_ROUTED_MXFP8) {
                 auto &hidden_quant_smem = reinterpret_cast<quant_bf16_tile &>(hidden_smem);
@@ -173,8 +177,11 @@ static __device__ __forceinline__ void swiglu_fwd_kernel(
                 auto &hidden_sc_smem = *reinterpret_cast<quant_sc_tile *>(reinterpret_cast<uint64_t>(&gate_smem[stage]) + sizeof(hidden_fp8_smem));
                 auto &hidden_fp8_t_smem = reinterpret_cast<quant_fp8_tile &>(up_smem[stage]);
                 auto &hidden_sc_t_smem = *reinterpret_cast<quant_sc_tile *>(reinterpret_cast<uint64_t>(&up_smem[stage]) + sizeof(hidden_fp8_t_smem));
+                const uint32_t column_amax_scratch_addr = static_cast<uint32_t>(__cvta_generic_to_shared(&hidden_sc_t_smem)) + sizeof(hidden_sc_t_smem); // still inside up_smem[stage]
+                static_assert(sizeof(hidden_fp8_t_smem) + sizeof(hidden_sc_t_smem) + 512 <= sizeof(up_smem[stage]));
 
-                mxfp8::quantize_tile<true, true, 128, false, false, QUANT_BLOCK_SIZE>(hidden_quant_smem, hidden_fp8_smem, hidden_sc_smem, hidden_fp8_t_smem, hidden_sc_t_smem, nullptr, threadIdx.x, 1);
+                // Threads 0-127 quantize the transposed layout while threads 128-255 quantize the normal one
+                mxfp8::quantize_tile<true, true, 128, true, false, QUANT_BLOCK_SIZE>(hidden_quant_smem, hidden_fp8_smem, hidden_sc_smem, hidden_fp8_t_smem, hidden_sc_t_smem, nullptr, threadIdx.x, 1, 0, column_amax_scratch_addr);
                 __syncthreads();
 
                 if (threadIdx.x == 0) {
@@ -183,6 +190,7 @@ static __device__ __forceinline__ void swiglu_fwd_kernel(
                     tma::store_async(*hidden_t_gmem, hidden_fp8_t_smem, {col, row - macrobatch_row_block_offset});
                     tma::store_async(*hidden_sc_t_gmem, hidden_sc_t_smem, {col, row - macrobatch_row_block_offset, 0, 0});
                 }
+                MOK_PROFILE_END(quant_start, REPLAY ? mok_profile::B_REPLAY_SWIGLU_QUANT : mok_profile::F_SWIGLU_QUANT);
             } else if (threadIdx.x == 0) {
                 tma::store_async(hidden_gmem, hidden_smem, {row - macrobatch_row_block_offset, col});
             }
@@ -261,7 +269,7 @@ static __device__ __forceinline__ void swiglu_bwd_kernel(
         : reinterpret_cast<uint64_t>(&up_smem) + sizeof(up_smem);
     auto &router_smem    = *reinterpret_cast<float (*)[config::SWIGLU_BWD_PIPE_DEPTH][config::SWIGLU_Mb]>(router_smem_addr);
 
-    const int intermediate_dim_col_blocks = gate_gmem.cols() / config::MLP_Nb;
+    const int intermediate_dim_col_blocks = ceil_div(gate_gmem.cols(), config::MLP_Nb);
     const int global_minibatch_idx = macrobatch_idx * (macrobatch_size / minibatch_size) + minibatch_idx;
     const int macrobatch_row_block_offset = macrobatch_idx * (macrobatch_size / config::SWIGLU_Mb);
 
@@ -326,6 +334,7 @@ static __device__ __forceinline__ void swiglu_bwd_kernel(
         if (tile_idx < tile_end) {
             wait(swiglu_inputs_arrived[stage], get_phasebit<0>(swiglu_bitfield, stage));
             update_phasebit<0>(swiglu_bitfield, stage);
+            MOK_PROFILE_START(compute_start);
 
             int row = first_row;
             int col = first_col + stage;
@@ -480,6 +489,8 @@ static __device__ __forceinline__ void swiglu_bwd_kernel(
                 move<bf16>::sts(static_cast<uint32_t>(__cvta_generic_to_shared(&gate_sc_smem[stage])) + scale_word_offset + k_block_pair * 2, std::bit_cast<bf16>(d_gate_scale_pair));
                 move<bf16>::sts(static_cast<uint32_t>(__cvta_generic_to_shared(&up_sc_smem[stage])) + scale_word_offset + k_block_pair * 2, std::bit_cast<bf16>(d_up_scale_pair));
                 __syncthreads(); // all normal-orientation outputs and BF16 stagings must be visible
+                MOK_PROFILE_END(compute_start, mok_profile::B_SWIGLU_BWD_COMPUTE);
+                MOK_PROFILE_START(tquant_start);
 
                 if (threadIdx.x == 0) {
                     tma::store_async(d_gate_gmem, gate_smem[stage], {row - macrobatch_row_block_offset, col});
@@ -488,16 +499,19 @@ static __device__ __forceinline__ void swiglu_bwd_kernel(
                     tma::store_async(*d_up_sc_gmem, up_sc_smem[stage], {row - macrobatch_row_block_offset, col, 0, 0});
                 }
 
-                // Transpose-quantize both gradients, one per warpgroup; d_gate was staged in the d_hidden tile, d_up in the shared staging buffer
+                // Transpose-quantize both gradients, one per warpgroup; d_gate was staged in the d_hidden tile, d_up in the shared staging buffer.
+                // Blockwise FP8 exchanges column amaxes through 512 bytes of scratch per warpgroup (the row-amax buffer, free again here).
+                const uint32_t column_amax_scratch_addr = static_cast<uint32_t>(__cvta_generic_to_shared(reinterpret_cast<void *>(router_smem_addr + sizeof(router_smem))));
                 if (threadIdx.x < config::QUANT_Mb)
-                    mxfp8::quantize_tile<false, true, 128, false, false, QUANT_BLOCK_SIZE>(d_hidden_smem[stage], d_t_fp8_smem[0], d_t_sc_smem[0], d_t_fp8_smem[0], d_t_sc_smem[0], nullptr, threadIdx.x, 1);
+                    mxfp8::quantize_tile<false, true, 128, false, false, QUANT_BLOCK_SIZE>(d_hidden_smem[stage], d_t_fp8_smem[0], d_t_sc_smem[0], d_t_fp8_smem[0], d_t_sc_smem[0], nullptr, threadIdx.x, 1, 0, column_amax_scratch_addr);
                 else
-                    mxfp8::quantize_tile<false, true, 128, false, false, QUANT_BLOCK_SIZE>(d_up_bf16_smem, d_t_fp8_smem[1], d_t_sc_smem[1], d_t_fp8_smem[1], d_t_sc_smem[1], nullptr, threadIdx.x - config::QUANT_Mb, 2);
+                    mxfp8::quantize_tile<false, true, 128, false, false, QUANT_BLOCK_SIZE>(d_up_bf16_smem, d_t_fp8_smem[1], d_t_sc_smem[1], d_t_fp8_smem[1], d_t_sc_smem[1], nullptr, threadIdx.x - config::QUANT_Mb, 2, 0, column_amax_scratch_addr + 512);
                 
                 // Store partial router gradient to smem for the first col half to handle later
                 if (tile_col_half != 0) 
                     router_smem[stage][tile_row] = router_grad_partial;
                 __syncthreads(); // quantized tiles must be complete before TMA reads them & partial router gradient must be fully stored
+                MOK_PROFILE_END(tquant_start, mok_profile::B_SWIGLU_BWD_TQUANT);
 
                 if (threadIdx.x == 0) {
                     tma::store_async(*d_gate_t_gmem, d_t_fp8_smem[0], {col, row - macrobatch_row_block_offset});

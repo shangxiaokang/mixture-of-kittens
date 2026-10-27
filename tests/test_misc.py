@@ -49,6 +49,7 @@ def _run_e2e_case(
     grad_seed: int | None = None,
     top_experts: torch.Tensor | None = None,
     group: dist.ProcessGroup | None = None,
+    shared_gate: bool = False,
 ) -> None:
     rank, _, device = context
     ep_group = dist.group.WORLD if group is None else group
@@ -161,7 +162,18 @@ def _run_e2e_case(
         w_routed_down,
         d_output,
     )
-    reference = run_reference_bf16(*input_tuple, group=ep_group)
+    # Optional per-token gate on the shared expert (sigmoid-like values in (0, 1)); MoK takes it in the forward
+    # epilogue and the pre-scaled output gradient in the backward, and the gate's own gradient comes from y_shared.
+    gate = None
+    fwd_kwargs: dict[str, torch.Tensor] = {}
+    bwd_kwargs: dict[str, torch.Tensor] = {}
+    result_names = RESULT_NAMES
+    if shared_gate:
+        gate = torch.rand(num_local_tokens, generator=generator, device=device, dtype=torch.float32)
+        fwd_kwargs = {"shared_gate": gate}
+        bwd_kwargs = {"d_y_shared": (gate.unsqueeze(1) * d_output.float()).to(torch.bfloat16)}
+        result_names = (*RESULT_NAMES, "d_shared_gate")
+    reference = run_reference_bf16(*input_tuple, group=ep_group, shared_gate=gate)
     workspace = functional.get_workspace(
         config,
         ep_group,
@@ -191,6 +203,7 @@ def _run_e2e_case(
                 w_routed_gate,
                 w_routed_up,
                 w_routed_down,
+                **fwd_kwargs,
             )
             gradients = functional.backward(
                 config,
@@ -206,6 +219,7 @@ def _run_e2e_case(
                 w_routed_gate,
                 w_routed_up,
                 w_routed_down,
+                **bwd_kwargs,
             )
             actual = (output, *gradients)
             tolerance = BF16_TOLERANCE
@@ -258,6 +272,7 @@ def _run_e2e_case(
                 (w_routed_gate_fp8, w_routed_gate_sc),
                 (w_routed_up_fp8, w_routed_up_sc),
                 (w_routed_down_fp8, w_routed_down_sc),
+                **fwd_kwargs,
             )
             gradients = functional.backward(
                 config,
@@ -286,6 +301,7 @@ def _run_e2e_case(
                     w_routed_down_t_fp8,
                     w_routed_down_t_sc,
                 ),
+                **bwd_kwargs,
             )
             actual = (output, *gradients)
             tolerance = MXFP8_TOLERANCE
@@ -339,6 +355,7 @@ def _run_e2e_case(
                 (w_routed_gate_fp8, w_routed_gate_sc),
                 (w_routed_up_fp8, w_routed_up_sc),
                 (w_routed_down_fp8, w_routed_down_sc),
+                **fwd_kwargs,
             )
             gradients = functional.backward(
                 blockwise_config,
@@ -367,14 +384,18 @@ def _run_e2e_case(
                     w_routed_down_t_fp8,
                     w_routed_down_t_sc,
                 ),
+                **bwd_kwargs,
             )
             actual = (output, *gradients)
             tolerance = BLOCKWISE_FP8_TOLERANCE
             gradient_min_cosine = BLOCKWISE_FP8_GRADIENT_MIN_COSINE
         else:
             raise AssertionError(f"unsupported precision {precision!r}")
+        if gate is not None:
+            assert forward_context.y_shared is not None
+            actual = (*actual, functional.shared_gate_backward(d_output, forward_context.y_shared))
         for result_name, expected, result in zip(
-            RESULT_NAMES,
+            result_names,
             reference,
             actual,
             strict=True,
@@ -387,7 +408,7 @@ def _run_e2e_case(
                 print_stats=rank == 0,
             )
         for result_name, expected, result in zip(
-            RESULT_NAMES[1:],
+            result_names[1:],
             reference[1:],
             actual[1:],
             strict=True,
@@ -1982,6 +2003,71 @@ def test_e2e_different_topk(
                     macrobatch_size=512,
                 ),
                 precisions=("bf16", "mxfp8", "blockwise"),
+            )
+    finally:
+        functional.clear_workspace_cache()
+
+
+def test_e2e_intermediate_tail_tile(
+    context: tuple[int, int, torch.device],
+) -> None:
+    """intermediate_size that is a multiple of 128 but not of the 256-wide GEMM N tile.
+
+    The last column block of every GEMM whose N is the intermediate dim is then a half-width (128) tile and the gate/up
+    weight gradients are accumulated transposed; (2560, 640, 512 experts, topk 10) is Qwen3.8-Flash-Next's MoE shape.
+    """
+    functional.clear_workspace_cache()
+    try:
+        for hidden_size, intermediate_size, num_local_experts, topk in (
+            (2560, 640, 64, 10),
+            (1024, 384, 4, 4),
+        ):
+            _run_e2e_case(
+                context,
+                name=f"tail-h{hidden_size}-i{intermediate_size}",
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                num_local_experts=num_local_experts,
+                topk=topk,
+                config=functional.MoKConfig(
+                    minibatch_size=256,
+                    macrobatch_size=512,
+                ),
+                precisions=("bf16", "mxfp8", "blockwise"),
+            )
+    finally:
+        functional.clear_workspace_cache()
+
+
+def test_e2e_shared_expert_gate(
+    context: tuple[int, int, torch.device],
+) -> None:
+    """Per-token gate on the shared expert (Qwen3.8-Flash-Next: output = sigmoid(x @ v) * shared(x) + routed).
+
+    The gate enters MoK through functional.forward(shared_gate=...) (applied in the forward epilogue) and
+    functional.backward(d_y_shared=gate * d_y) (the shared expert's dgrad/wgrad GEMMs read the pre-scaled output
+    gradient while the routed path keeps d_y); its own gradient is shared_gate_backward(d_y, y_shared). Checked against
+    the torch reference for all three routed precisions, including the 128-wide tail-tile shape of Qwen3.8 (I=640).
+    """
+    functional.clear_workspace_cache()
+    try:
+        for hidden_size, intermediate_size, num_local_experts, topk in (
+            (2560, 640, 16, 10),
+            (1024, 512, 4, 4),
+        ):
+            _run_e2e_case(
+                context,
+                name=f"shared-gate-h{hidden_size}-i{intermediate_size}",
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                num_local_experts=num_local_experts,
+                topk=topk,
+                config=functional.MoKConfig(
+                    minibatch_size=256,
+                    macrobatch_size=512,
+                ),
+                precisions=("bf16", "mxfp8", "blockwise"),
+                shared_gate=True,
             )
     finally:
         functional.clear_workspace_cache()

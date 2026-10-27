@@ -5,6 +5,8 @@
 
 #include <ATen/ops/empty_like.h>
 
+#include <optional>
+
 using namespace kittens;
 
 namespace utils {
@@ -29,6 +31,7 @@ struct globals {
     activation_gl combine_buffer;  // (num_local_tokens * topk, H)
     weight_gl topk_weights;        // (num_local_tokens, topk)
     activation_gl output;          // (num_local_tokens, H)
+    const float *shared_gate;      // (num_local_tokens,) per-token scale of y_shared, or nullptr (= 1.0)
 
     __host__ inline dim3 grid() const {
         const int col_blocks = (y_shared.cols() + Nb - 1) / Nb;
@@ -54,6 +57,7 @@ static __device__ __forceinline__ void fwd_epilogue_kernel(const globals &g) {
     extern __shared__ int __shm[];
     auto *token_vecs = reinterpret_cast<globals::token_vec*>((reinterpret_cast<uint64_t>(&__shm[0]) + 1023) & ~uint64_t(1023));
     float *weights = reinterpret_cast<float*>(token_vecs + TOKENS_PER_CTA * num_tokens_per_stage); // (TOKENS_PER_CTA, topk)
+    __shared__ float shared_gates[TOKENS_PER_CTA];
 
     __shared__ semaphore inputs_arrived[TOKENS_PER_CTA];
     if (tid == 0) {
@@ -65,6 +69,8 @@ static __device__ __forceinline__ void fwd_epilogue_kernel(const globals &g) {
     }
     for (int i = tid; i < TOKENS_PER_CTA * topk; i += blockDim.x)
         weights[i] = g.topk_weights[{first_token_idx + i / topk, i % topk}];
+    if (tid < TOKENS_PER_CTA)
+        shared_gates[tid] = g.shared_gate != nullptr ? g.shared_gate[first_token_idx + tid] : 1.0f;
     __syncthreads();
 
     #pragma unroll
@@ -82,6 +88,8 @@ static __device__ __forceinline__ void fwd_epilogue_kernel(const globals &g) {
         rv_fl<globals::Nb / config::NUM_WARPS> accumulator, term;
         wait(inputs_arrived[stage], 0);
         compute_group::load(accumulator, stage_vecs[0]);
+        if (g.shared_gate != nullptr) // gated shared expert: output = gate * y_shared + sum_k w_k * y_routed_k
+            compute_group::mul(accumulator, accumulator, shared_gates[stage]);
         for (int k = 0; k < topk; ++k) {
             compute_group::load(term, stage_vecs[1 + k]);
             compute_group::mul(term, term, weights[stage * topk + k]);
@@ -97,14 +105,16 @@ static __device__ __forceinline__ void fwd_epilogue_kernel(const globals &g) {
 static __host__ at::Tensor fwd_epilogue_entrypoint(
     const at::Tensor &y_shared,
     const at::Tensor &combine_buffer,
-    const at::Tensor &topk_weights
+    const at::Tensor &topk_weights,
+    const std::optional<at::Tensor> &shared_gate
 ) {
     at::Tensor output = at::empty_like(y_shared);
     globals g {
         .y_shared = kittens::py::tensor_to_gl<globals::activation_gl>(y_shared),
         .combine_buffer = kittens::py::tensor_to_gl<globals::activation_gl>(combine_buffer),
         .topk_weights = kittens::py::tensor_to_gl<globals::weight_gl>(topk_weights),
-        .output = kittens::py::tensor_to_gl<globals::activation_gl>(output)
+        .output = kittens::py::tensor_to_gl<globals::activation_gl>(output),
+        .shared_gate = shared_gate.has_value() ? shared_gate->data_ptr<float>() : nullptr
     };
     kittens::py::launch_kernel<config, globals, fwd_epilogue_kernel>(g);
     return output;

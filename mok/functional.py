@@ -71,6 +71,10 @@ class MoKForwardContext:
     up_routed: torch.Tensor | tuple[torch.Tensor, torch.Tensor]
     hidden_shared: torch.Tensor
     hidden_routed: torch.Tensor | tuple[torch.Tensor, torch.Tensor]
+    # Shared-expert output before the gate, bfloat16 [num_local_tokens, hidden_size]. Only needed for the gradient of a
+    # per-token shared-expert gate, (grad_output * y_shared).sum(-1) (see shared_gate_backward()), so forward() retains it
+    # only when it was given a shared_gate; it is None otherwise and after recompute_forward_context().
+    y_shared: torch.Tensor | None = None
 
 
 @dataclass(slots=True)
@@ -505,11 +509,14 @@ def forward(
     routed_up_weights: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
     routed_down_weights: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
     swiglu_limit: float | None = None,
+    shared_gate: torch.Tensor | None = None,
 ) -> tuple[
     torch.Tensor,
     MoKForwardContext,
 ]:
     """Runs the MoE forward pass.
+
+    output = shared_gate[:, None] * shared_expert(x) + sum_k router_weights[:, k] * routed_expert_k(x)
 
     Inputs:
         config:              MoKConfig
@@ -524,12 +531,21 @@ def forward(
         routed_up_weights:   bfloat16 [num_local_experts, intermediate_size, hidden_size] or FP8 data/scale tuple (recipe per config.fp8_recipe)
         routed_down_weights: bfloat16 [num_local_experts, hidden_size, intermediate_size] or FP8 data/scale tuple (recipe per config.fp8_recipe)
         swiglu_limit:        float | None
+        shared_gate:         float32 [num_local_tokens] | None, per-token scale of the shared expert output (e.g. a
+                             sigmoid gate); None keeps the ungated shared expert. Its gradient is
+                             shared_gate_backward(grad_output, forward_context.y_shared) and the backward pass takes
+                             d_y_shared = (shared_gate[:, None] * grad_output).bfloat16().
 
     Outputs:
         output:          bfloat16 [num_local_tokens, hidden_size]
-        forward_context: MoKForwardContext
+        forward_context: MoKForwardContext (y_shared holds the ungated shared expert output when shared_gate is given,
+                         None otherwise so that an ungated forward does not keep an extra num_local_tokens x hidden_size tensor alive)
     """
     validate_inputs(config, workspace, schedule, x, router_weights)
+    if shared_gate is not None:
+        if (not shared_gate.is_cuda or shared_gate.device != workspace.device or shared_gate.dtype != torch.float32
+                or not shared_gate.is_contiguous() or tuple(shared_gate.shape) != (workspace.num_local_tokens,)):
+            raise ValueError("shared_gate must be a contiguous float32 (num_local_tokens,) tensor on the workspace device")
 
     workspace.x_buffer.copy_(x)  # TODO: we can remove this
     workspace.router_weight_buffer.copy_(router_weights)
@@ -563,6 +579,7 @@ def forward(
             up_routed=(up_fp8_routed, up_sc_routed),
             hidden_shared=hidden_shared,
             hidden_routed=(hidden_fp8_t_routed, hidden_sc_t_routed),
+            y_shared=y_shared if shared_gate is not None else None,
         )
     else:
         (x_routed, gate_shared, gate_routed, up_shared, up_routed,
@@ -585,12 +602,28 @@ def forward(
             up_routed=up_routed,
             hidden_shared=hidden_shared,
             hidden_routed=hidden_routed,
+            y_shared=y_shared if shared_gate is not None else None,
         )
 
     barrier_all(workspace.barrier_buffer, workspace.barrier_buffer_ptrs,
                 workspace.barrier_buffer_multicast_ptr, workspace.barrier_target)
-    output = fwd_epilogue(y_shared, workspace.combine_buffer, workspace.router_weight_buffer)
+    output = fwd_epilogue(y_shared, workspace.combine_buffer, workspace.router_weight_buffer, shared_gate)
     return output, forward_context
+
+
+def shared_gate_backward(grad_output: torch.Tensor, y_shared: torch.Tensor) -> torch.Tensor:
+    """Gradient of a per-token shared-expert gate: d_shared_gate[t] = sum_h grad_output[t, h] * y_shared[t, h].
+
+    Inputs:
+        grad_output: bfloat16 [num_local_tokens, hidden_size]
+        y_shared:    bfloat16 [num_local_tokens, hidden_size] (forward_context.y_shared of a forward() call that received shared_gate)
+
+    Outputs:
+        d_shared_gate: float32 [num_local_tokens]
+    """
+    if grad_output.shape != y_shared.shape or grad_output.ndim != 2:
+        raise ValueError("grad_output and y_shared must both have shape (num_local_tokens, hidden_size)")
+    return (grad_output.float() * y_shared.float()).sum(dim=-1)
 
 
 def recompute_forward_context(
@@ -689,6 +722,7 @@ def backward(
     routed_up_weights: torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
     routed_down_weights: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
     swiglu_limit: float | None = None,
+    d_y_shared: torch.Tensor | None = None,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -716,9 +750,12 @@ def backward(
         routed_up_weights:   bfloat16 [num_local_experts, intermediate_size, hidden_size] or FP8 tensor tuple (recipe per config.fp8_recipe)
         routed_down_weights: bfloat16 [num_local_experts, hidden_size, intermediate_size] or FP8 tensor tuple (recipe per config.fp8_recipe)
         swiglu_limit:        float | None
+        d_y_shared:          bfloat16 [num_local_tokens, hidden_size] | None, the output gradient as seen by the shared
+                             expert. None means grad_output (ungated shared expert); with a forward shared_gate pass
+                             (shared_gate[:, None] * grad_output).bfloat16(). The routed experts always use grad_output.
 
     Outputs:
-        d_x:                   bfloat16 [num_local_tokens, hidden_size]
+        d_x:                   bfloat16 [num_local_tokens, hidden_size] (excluding the gate's own d_x term, see shared_gate_backward)
         d_router_weights:      float32 [num_local_tokens, topk]
         d_routed_gate_weights: bfloat16 [num_local_experts, intermediate_size, hidden_size]
         d_routed_up_weights:   bfloat16 [num_local_experts, intermediate_size, hidden_size]
@@ -730,6 +767,11 @@ def backward(
     validate_inputs(config, workspace, schedule, x, router_weights, grad_output)
     if not isinstance(forward_context, MoKForwardContext):
         raise TypeError("forward_context must be a MoKForwardContext")
+    if d_y_shared is not None and (
+        not d_y_shared.is_cuda or d_y_shared.device != workspace.device or d_y_shared.dtype != torch.bfloat16
+        or not d_y_shared.is_contiguous() or tuple(d_y_shared.shape) != tuple(grad_output.shape)
+    ):
+        raise ValueError("d_y_shared must be a contiguous bfloat16 tensor shaped like grad_output on the workspace device")
 
     workspace.d_y_buffer.copy_(grad_output)                # TODO: we can remove this
     workspace.x_buffer.copy_(x)                            # TODO: we can remove this
@@ -770,6 +812,7 @@ def backward(
             schedule.num_tokens, schedule.tokens_per_expert,
             workspace.topk, swiglu_limit, config.bwd_num_comm_sms,
             config.macrobatch_size, config.minibatch_size,
+            d_y_shared=d_y_shared,
         )
     else:
         x_routed = forward_context.x_routed
@@ -795,6 +838,7 @@ def backward(
             schedule.num_tokens, schedule.tokens_per_expert,
             workspace.topk, swiglu_limit, config.bwd_num_comm_sms,
             config.macrobatch_size, config.minibatch_size,
+            d_y_shared=d_y_shared,
         )
 
     barrier_all(workspace.barrier_buffer, workspace.barrier_buffer_ptrs,

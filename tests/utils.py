@@ -378,6 +378,7 @@ def run_reference_bf16(
     swiglu_limit: float | None = None,
     *,
     group: dist.ProcessGroup | None = None,
+    shared_gate: torch.Tensor | None = None,  # [T] float32 per-token scale of the shared expert output
 ) -> tuple[
     torch.Tensor,  # output
     torch.Tensor,  # d_x
@@ -388,6 +389,7 @@ def run_reference_bf16(
     torch.Tensor,  # d_w_shared_gate
     torch.Tensor,  # d_w_shared_up
     torch.Tensor,  # d_w_shared_down
+    *tuple[torch.Tensor, ...],  # d_shared_gate [T] (only when shared_gate is given)
 ]:
     world_size = dist.get_world_size(group)
     rank = dist.get_rank(group)
@@ -440,8 +442,14 @@ def run_reference_bf16(
     up_shared = x_shared @ w_shared_up.T
     shared_output = run_swiglu_reference(gate_shared, up_shared, swiglu_limit) @ w_shared_down.T
 
-    # Final sum
-    output = (routed_output + shared_output.float()).to(torch.bfloat16)
+    # Final sum (the gate scales the shared expert output per token)
+    if shared_gate is None:
+        gated_shared_output = shared_output.float()
+        d_shared_output = d_output
+    else:
+        gated_shared_output = shared_output.float() * shared_gate.float().unsqueeze(1)
+        d_shared_output = (d_output.float() * shared_gate.float().unsqueeze(1)).to(torch.bfloat16)
+    output = (routed_output + gated_shared_output).to(torch.bfloat16)
 
     # Combine all-to-all
     d_flat_output = (d_output.unsqueeze(1).float() * router_weights.unsqueeze(2)).to(torch.bfloat16)
@@ -461,12 +469,12 @@ def run_reference_bf16(
     d_x_shared, d_w_shared_gate, d_w_shared_up, d_w_shared_down = torch.autograd.grad(
         shared_output,
         (x_shared, w_shared_gate, w_shared_up, w_shared_down),
-        d_output,
+        d_shared_output,
     )
     d_x = (d_x_routed + d_x_shared.float()).to(torch.bfloat16)
     d_router_weights = (d_output.unsqueeze(1).float() * flat_output.view(num_local_tokens, topk, hidden).float()).sum(2)
 
-    return (
+    results = (
         output,             # [T, H]
         d_x,                # [T, H]
         d_router_weights,   # [T, TOPK]
@@ -477,6 +485,10 @@ def run_reference_bf16(
         d_w_shared_up,      # [I, H]
         d_w_shared_down,    # [H, I]
     )
+    if shared_gate is not None:
+        d_shared_gate = (d_output.float() * shared_output.detach().float()).sum(1)  # [T]
+        results = (*results, d_shared_gate)
+    return results
 
 
 def get_error_stats(

@@ -1,4 +1,5 @@
-template <bool SCALE_ROWS = false>
+// REPLAY marks the backward's replay of the forward dispatch (profiling category only)
+template <bool SCALE_ROWS = false, bool REPLAY = false>
 static __device__ __forceinline__ void dispatch_kernel(
     const activation_bf16_pgl &peer_buf,
     const routed_activation_gl &x_gmem,
@@ -29,6 +30,8 @@ static __device__ __forceinline__ void dispatch_kernel(
     auto &x_fp8_t_tiles       = *reinterpret_cast<quant_fp8_tile (*)[config::DISPATCH_OUT_TILES]>(smem_base_addr + sizeof(token_chunks) + sizeof(x_fp8_tiles) + sizeof(x_sc_tiles));
     auto &x_sc_t_tiles        = *reinterpret_cast<quant_sc_tile (*)[config::DISPATCH_OUT_TILES]>(smem_base_addr + sizeof(token_chunks) + sizeof(x_fp8_tiles) + sizeof(x_sc_tiles) + sizeof(x_fp8_t_tiles));
     auto &router_weights_smem = *reinterpret_cast<float (*)[config::DISPATCH_Mb]>(smem_base_addr + sizeof(token_chunks) + sizeof(x_fp8_tiles) + sizeof(x_sc_tiles) + sizeof(x_fp8_t_tiles) + sizeof(x_sc_t_tiles));
+    // Blockwise FP8 transposed quantize: 128 words of column-amax exchange scratch
+    const uint32_t column_amax_scratch_addr = static_cast<uint32_t>(__cvta_generic_to_shared(reinterpret_cast<void *>(smem_base_addr + sizeof(token_chunks) + sizeof(x_fp8_tiles) + sizeof(x_sc_tiles) + sizeof(x_fp8_t_tiles) + sizeof(x_sc_t_tiles) + sizeof(router_weights_smem))));
 
     const int tid = threadIdx.x;
     const bool is_worker = tid < config::DISPATCH_Mb; // only these threads move tokens, but all threads join the barriers and waits
@@ -86,6 +89,7 @@ static __device__ __forceinline__ void dispatch_kernel(
     update_phasebit<0>(bitfield, 0);
 
     if constexpr (USE_MXFP8) {
+        MOK_PROFILE_START(quant_start);
         // Quantize each 128x128 subtile of the staging buffer
         const int row_block = row_idx / config::QUANT_Mb;
         const int num_subtiles = chunk_cols / config::QUANT_Nb;
@@ -98,9 +102,9 @@ static __device__ __forceinline__ void dispatch_kernel(
                 if (tid == 0) tma::store_async_read_wait<4 * (config::DISPATCH_OUT_TILES - 1)>();
                 __syncthreads(); // also makes zero-filled rows visible before the first transpose-quantize
                 if constexpr (!SCALE_ROWS)
-                    mxfp8::quantize_tile<true, true, config::DISPATCH_Nb, true, false, QUANT_BLOCK_SIZE>(x_bf16_subtile, x_fp8_tiles[out], x_sc_tiles[out], x_fp8_t_tiles[out], x_sc_t_tiles[out], nullptr, tid, 1);
+                    mxfp8::quantize_tile<true, true, config::DISPATCH_Nb, true, false, QUANT_BLOCK_SIZE>(x_bf16_subtile, x_fp8_tiles[out], x_sc_tiles[out], x_fp8_t_tiles[out], x_sc_t_tiles[out], nullptr, tid, 1, 0, column_amax_scratch_addr);
                 else
-                    mxfp8::quantize_tile<true, true, config::DISPATCH_Nb, true, true, QUANT_BLOCK_SIZE> (x_bf16_subtile, x_fp8_tiles[out], x_sc_tiles[out], x_fp8_t_tiles[out], x_sc_t_tiles[out], router_weights_smem, tid, 1);
+                    mxfp8::quantize_tile<true, true, config::DISPATCH_Nb, true, true, QUANT_BLOCK_SIZE> (x_bf16_subtile, x_fp8_tiles[out], x_sc_tiles[out], x_fp8_t_tiles[out], x_sc_t_tiles[out], router_weights_smem, tid, 1, 0, column_amax_scratch_addr);
                 __syncthreads(); // quantized tiles must be complete before TMA reads them
 
                 if (tid == 0) {
@@ -112,6 +116,8 @@ static __device__ __forceinline__ void dispatch_kernel(
                 }
             }
         }
+        MOK_PROFILE_END(quant_start, REPLAY ? mok_profile::B_REPLAY_DISPATCH_QUANT
+                                     : SCALE_ROWS ? mok_profile::B_REV_COMBINE_QUANT : mok_profile::F_DISPATCH_QUANT);
     } else {
         if constexpr (SCALE_ROWS) {
             if (is_worker && peer_rank >= 0) {

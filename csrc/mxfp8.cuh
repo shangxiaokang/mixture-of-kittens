@@ -17,10 +17,6 @@ namespace mxfp8 {
 //                       supplies the scale (weights)
 static constexpr int HW_BLOCK_SIZE = 32;
 static constexpr int BLOCKWISE_BLOCK_SIZE = 128;
-// Blockwise transposed quantization: two passes over shared memory (amax, then quantize). Keeping the whole 128-element
-// row in registers instead (true) was measured on B300 to spill ~230 bytes per thread in the megakernels and to be
-// slightly slower, so the two-pass scheme is the default.
-static constexpr bool BLOCKWISE_TRANSPOSED_SINGLE_PASS = false;
 
 struct config {
     static constexpr int Mb = 128;
@@ -157,10 +153,100 @@ static __device__ __forceinline__ float tile_amax(
     return fmaxf(fmaxf(scratch[0], scratch[1]), fmaxf(scratch[2], scratch[3]));
 }
 
+// Blockwise (1x128) quantization of a 128x128 BF16 tile into the transposed FP8 layout. Each 128-element row of the
+// transposed output is one column of the source, so its scale needs the amax over all 128 source rows before any
+// element can be quantized, and the source column is strided in shared memory. Rather than one thread per column
+// reading 16-bit elements (and either holding the whole column in registers or reading it twice), thread t handles the
+// column pair p (source columns 2p and 2p+1, one 32-bit word per source row) for the 64 source rows whose 4-row group
+// has parity h: pass 1 accumulates both column amaxes with packed bf16x2 max and exchanges them with the thread that
+// holds the other row parity through a 512-byte scratch buffer; pass 2 re-reads the 64 words and emits 4 consecutive
+// tokens of each column as one 32-bit word. The lane -> (p, h) assignment makes every load and store conflict-free:
+// loads of one warp cover 32 distinct words of a source row (the bank of a word depends on p only, since rows are a
+// multiple of 128 bytes apart), stores rotate the row group across lanes and give the two half-warps opposite row
+// parities (32 distinct banks of the 128-byte transposed rows).
+//   SRC_ROW_STRIDE: row stride of the BF16 source in elements (a multiple of 64)
+//   FIXED_SCALE:    use the caller's scale byte for every column (no amax pass, no scratch)
+// Must be called by 128 threads (tid 0-127); barrier_id is a named barrier private to these threads.
+template <int SRC_ROW_STRIDE, bool FIXED_SCALE>
+static __device__ __forceinline__ void quantize_tile_transposed_blockwise(
+    const uint32_t bf16_src_addr,
+    const uint32_t fp8_dst_addr,
+    const uint32_t sc_dst_addr,
+    const int tid,
+    const int barrier_id,
+    const uint32_t fixed_scale_byte,
+    const uint32_t amax_scratch_addr
+) {
+    constexpr int TILE_SIZE = 128;
+    static_assert(SRC_ROW_STRIDE % 64 == 0, "rows must be a multiple of 128 bytes apart for conflict-free packed loads");
+    const int lane = tid % WARP_THREADS;
+    const int warp = tid / WARP_THREADS;
+    const int quarter = 2 * (warp % 2) + lane / 16;      // which 16 column pairs this half-warp covers
+    const int p = lane % 16 + 16 * quarter;              // column pair: source columns 2p and 2p+1
+    const int h = (lane / 16) ^ (warp / 2);              // parity of this thread's 4-row source groups
+
+    auto load_word = [&](int src_row) {
+        bf16_2 v;
+        move<bf16_2>::lds(v, bf16_src_addr + (src_row * SRC_ROW_STRIDE + 2 * p) * sizeof(bf16));
+        return v;
+    };
+
+    uint32_t scale_byte0 = fixed_scale_byte, scale_byte1 = fixed_scale_byte;
+    if constexpr (!FIXED_SCALE) {
+        // Pass 1: column amaxes of this thread's 64 rows, then the other parity's from the partner thread
+        bf16_2 amax = __floats2bfloat162_rn(0.0f, 0.0f);
+        #pragma unroll 4
+        for (int k = 0; k < 16; ++k) {
+            const int src_row = (2 * k + h) * 4;
+            #pragma unroll
+            for (int i = 0; i < 4; ++i)
+                amax = __hmax2(amax, __habs2(load_word(src_row + i)));
+        }
+        move<bf16_2>::sts(amax_scratch_addr + (h * 64 + p) * sizeof(bf16_2), amax);
+        group<TILE_SIZE / WARP_THREADS>::sync(barrier_id);
+        bf16_2 other_amax;
+        move<bf16_2>::lds(other_amax, amax_scratch_addr + ((h ^ 1) * 64 + p) * sizeof(bf16_2));
+        amax = __hmax2(amax, other_amax);
+        scale_byte0 = scale_byte_from_amax(__bfloat162float(amax.x));
+        scale_byte1 = scale_byte_from_amax(__bfloat162float(amax.y));
+    }
+
+    // Pass 2: quantize; 4 consecutive source rows of a column form one 32-bit word of the transposed row
+    const float scale_inv0 = scale_inv_from_byte(scale_byte0);
+    const float scale_inv1 = scale_inv_from_byte(scale_byte1);
+    const uint32_t fp8_dst_addr0 = fp8_dst_addr + (2 * p) * TILE_SIZE; // transposed row 2p
+    const uint32_t fp8_dst_addr1 = fp8_dst_addr0 + TILE_SIZE;          // transposed row 2p + 1
+    #pragma unroll 2
+    for (int s = 0; s < 16; ++s) {
+        const int k = (lane % 16 + s) % 16; // rotate the row group across lanes so that the stores hit distinct banks
+        const int src_row = (2 * k + h) * 4;
+        float2 v[4];
+        #pragma unroll
+        for (int i = 0; i < 4; ++i)
+            v[i] = __bfloat1622float2(load_word(src_row + i));
+        uint16_t c0_01, c0_23, c1_01, c1_23;
+        asm volatile("{cvt.rn.satfinite.e4m3x2.f32 %0, %2, %1;}" : "=h"(c0_01) : "f"(v[0].x * scale_inv0), "f"(v[1].x * scale_inv0));
+        asm volatile("{cvt.rn.satfinite.e4m3x2.f32 %0, %2, %1;}" : "=h"(c0_23) : "f"(v[2].x * scale_inv0), "f"(v[3].x * scale_inv0));
+        asm volatile("{cvt.rn.satfinite.e4m3x2.f32 %0, %2, %1;}" : "=h"(c1_01) : "f"(v[0].y * scale_inv1), "f"(v[1].y * scale_inv1));
+        asm volatile("{cvt.rn.satfinite.e4m3x2.f32 %0, %2, %1;}" : "=h"(c1_23) : "f"(v[2].y * scale_inv1), "f"(v[3].y * scale_inv1));
+        move<int>::sts(fp8_dst_addr0 + src_row, std::bit_cast<int>(static_cast<uint32_t>(c0_01) | (static_cast<uint32_t>(c0_23) << 16)));
+        move<int>::sts(fp8_dst_addr1 + src_row, std::bit_cast<int>(static_cast<uint32_t>(c1_01) | (static_cast<uint32_t>(c1_23) << 16)));
+    }
+
+    // Scale words of transposed rows 2p and 2p+1 (tcgen05 scale-factor layout, see quantize_tile)
+    const int row0 = 2 * p, row1 = 2 * p + 1;
+    move<int>::sts(sc_dst_addr + (row0 % 32) * 16 + (row0 / 32) * 4, std::bit_cast<int>(replicate_scale_byte(scale_byte0)));
+    move<int>::sts(sc_dst_addr + (row1 % 32) * 16 + (row1 / 32) * 4, std::bit_cast<int>(replicate_scale_byte(scale_byte1)));
+}
+
 // Quantizes a 128x128 BF16 tile held in shared memory into FP8 data and scale tiles, in the normal and/or transposed layouts.
 //   K_BLOCK_SIZE = 32:  one scale per 32-element sub-block of each row (MXFP8)
 //   K_BLOCK_SIZE = 128: one scale per 128-element row, replicated over its 4 sub-blocks (blockwise FP8)
 //   FIXED_SCALE:        use the caller's scale byte for every row (e.g. one scale for the whole 128x128 tile)
+//   SPLIT_PASSES:       threads 0-127 produce the transposed outputs while threads 128-255 produce the normal ones
+//   SCALE_ROWS:         multiply row r by row_scales[r] (rounded to BF16) before quantizing
+//   amax_scratch_addr:  512 bytes of shared memory (blockwise FP8 with a transposed output and no fixed scale only)
+// Named barriers barrier_id .. barrier_id + 6 are used by the threads that call this.
 template <bool RETURN_NORMAL, bool RETURN_TRANSPOSED, int SRC_ROW_STRIDE = 128, bool SPLIT_PASSES = false, bool SCALE_ROWS = false,
           int K_BLOCK_SIZE = HW_BLOCK_SIZE, bool FIXED_SCALE = false>
 static __device__ __forceinline__ void quantize_tile(
@@ -172,7 +258,8 @@ static __device__ __forceinline__ void quantize_tile(
     const float *row_scales,
     const int _tid,
     const int barrier_id,
-    const uint32_t fixed_scale_byte = 0
+    const uint32_t fixed_scale_byte = 0,
+    const uint32_t amax_scratch_addr = 0
 ) {
     constexpr int TILE_SIZE = 128;
     static_assert(RETURN_NORMAL || RETURN_TRANSPOSED, "At least one output pair must be requested");
@@ -180,6 +267,10 @@ static __device__ __forceinline__ void quantize_tile(
     static_assert(K_BLOCK_SIZE == HW_BLOCK_SIZE || K_BLOCK_SIZE == BLOCKWISE_BLOCK_SIZE, "K_BLOCK_SIZE must be 32 (MXFP8) or 128 (blockwise FP8)");
     static_assert(!FIXED_SCALE || K_BLOCK_SIZE == BLOCKWISE_BLOCK_SIZE, "A fixed scale implies one scale per row");
     constexpr bool PER_SUB_BLOCK_SCALE = K_BLOCK_SIZE == HW_BLOCK_SIZE;
+    // Blockwise FP8 with row scaling: the normal-layout threads, which load and scale whole rows anyway, write the scaled
+    // rows back over the source before the transposed-layout threads read it, so the transposed pass needs no scaling.
+    constexpr bool TRANSPOSED_READS_PRESCALED = !PER_SUB_BLOCK_SCALE && SCALE_ROWS && RETURN_TRANSPOSED;
+    static_assert(!TRANSPOSED_READS_PRESCALED || SPLIT_PASSES, "Blockwise FP8 row scaling with a transposed output requires SPLIT_PASSES");
 
     // Excess threads have no tile rows to handle. Caller must ensure that this is called by threads 0-127, or 0-255 with SPLIT_PASSES
     const int tid = SPLIT_PASSES ? _tid % TILE_SIZE : _tid;
@@ -197,6 +288,16 @@ static __device__ __forceinline__ void quantize_tile(
         if (SPLIT_PASSES && transposed != (_tid < TILE_SIZE)) continue;
         const uint32_t fp8_dst_addr = static_cast<uint32_t>(__cvta_generic_to_shared(transposed ? &x_fp8_t_tile : &x_fp8_tile));
         const uint32_t sc_dst_addr = static_cast<uint32_t>(__cvta_generic_to_shared(transposed ? &x_sc_t_tile : &x_sc_tile));
+
+        if constexpr (!PER_SUB_BLOCK_SCALE) {
+            if (transposed) {
+                if constexpr (TRANSPOSED_READS_PRESCALED)
+                    group<2 * TILE_SIZE / WARP_THREADS>::sync(barrier_id + 6); // scaled rows written back by the normal-layout threads
+                quantize_tile_transposed_blockwise<SRC_ROW_STRIDE, FIXED_SCALE>(
+                    bf16_src_addr, fp8_dst_addr, sc_dst_addr, tid, barrier_id + 4, fixed_scale_byte, amax_scratch_addr);
+                continue;
+            }
+        }
         const int row = transposed ? (tid % 64) * 2 + tid / 64 : tid;
 
         auto load_k_block = [&](int k_block_idx, bf16_2 (&dst)[PACKED_PER_K_BLOCK]) {
@@ -260,53 +361,40 @@ static __device__ __forceinline__ void quantize_tile(
                 }
             }
         } else {
-            // One scale per 128-element row: the row amax (or the caller's scale) must be known before any sub-block is quantized
+            // Normal layout, one scale per 128-element row: load the whole row up front (the FP8 output may alias the
+            // BF16 source), take its amax (or the caller's scale), then quantize
             uint32_t scale_byte = fixed_scale_byte;
-            if (!transposed || BLOCKWISE_TRANSPOSED_SINGLE_PASS) {
-                // Load the whole row up front (the normal layout writes FP8 in place over the BF16 source, so it has to)
-                bf16_2 x_bf16_reg[NUM_K_BLOCKS][PACKED_PER_K_BLOCK];
+            bf16_2 x_bf16_reg[NUM_K_BLOCKS][PACKED_PER_K_BLOCK];
+            #pragma unroll
+            for (int j = 0; j < NUM_K_BLOCKS; j++)
+                load_k_block((j + tid/8) % NUM_K_BLOCKS, x_bf16_reg[j]);
+            if constexpr (TRANSPOSED_READS_PRESCALED) {
+                // Publish the scaled row (in place) for the transposed-layout threads
                 #pragma unroll
-                for (int j = 0; j < NUM_K_BLOCKS; j++)
-                    load_k_block((j + tid/8) % NUM_K_BLOCKS, x_bf16_reg[j]);
-                if constexpr (!FIXED_SCALE) {
-                    bf16_2 amax = block_amax(x_bf16_reg[0]);
-                    #pragma unroll
-                    for (int j = 1; j < NUM_K_BLOCKS; j++)
-                        amax = __hmax2(amax, block_amax(x_bf16_reg[j]));
-                    scale_byte = scale_byte_from_amax(amax_to_float(amax));
-                }
-                if (!transposed)
-                    group<TILE_SIZE / WARP_THREADS>::sync(barrier_id); // in-place writes may begin
-                const float scale_inv = scale_inv_from_byte(scale_byte);
-                #pragma unroll
-                for (int j = 0; j < NUM_K_BLOCKS; j++) {
-                    uint32_t x_fp8_reg[PACKED_PER_K_BLOCK / 2];
-                    quantize_block_with_scale(x_bf16_reg[j], x_fp8_reg, scale_inv);
-                    store_k_block((j + tid/8) % NUM_K_BLOCKS, x_fp8_reg);
-                }
-            } else {
-                // Two passes over shared memory (amax, then quantize) instead of holding the row in registers
-                // (only used when BLOCKWISE_TRANSPOSED_SINGLE_PASS is false)
-                if constexpr (!FIXED_SCALE) {
-                    bf16_2 amax = __floats2bfloat162_rn(0.0f, 0.0f);
-                    #pragma unroll 1
-                    for (int j = 0; j < NUM_K_BLOCKS; j++) {
-                        bf16_2 x_bf16_reg[PACKED_PER_K_BLOCK];
-                        load_k_block((j + tid/8) % NUM_K_BLOCKS, x_bf16_reg);
-                        amax = __hmax2(amax, block_amax(x_bf16_reg));
-                    }
-                    scale_byte = scale_byte_from_amax(amax_to_float(amax));
-                }
-                const float scale_inv = scale_inv_from_byte(scale_byte);
-                #pragma unroll 1
                 for (int j = 0; j < NUM_K_BLOCKS; j++) {
                     const int k_block_idx = (j + tid/8) % NUM_K_BLOCKS;
-                    bf16_2 x_bf16_reg[PACKED_PER_K_BLOCK];
-                    uint32_t x_fp8_reg[PACKED_PER_K_BLOCK / 2];
-                    load_k_block(k_block_idx, x_bf16_reg);
-                    quantize_block_with_scale(x_bf16_reg, x_fp8_reg, scale_inv);
-                    store_k_block(k_block_idx, x_fp8_reg);
+                    #pragma unroll
+                    for (int k = 0; k < PACKED_PER_K_BLOCK; k++) {
+                        const int col = k_block_idx*HW_BLOCK_SIZE + (tid*4 + k*2) % HW_BLOCK_SIZE;
+                        move<bf16_2>::sts(bf16_src_addr + (row*SRC_ROW_STRIDE + col) * sizeof(bf16), x_bf16_reg[j][k]);
+                    }
                 }
+                group<2 * TILE_SIZE / WARP_THREADS>::sync(barrier_id + 6);
+            }
+            if constexpr (!FIXED_SCALE) {
+                bf16_2 amax = block_amax(x_bf16_reg[0]);
+                #pragma unroll
+                for (int j = 1; j < NUM_K_BLOCKS; j++)
+                    amax = __hmax2(amax, block_amax(x_bf16_reg[j]));
+                scale_byte = scale_byte_from_amax(amax_to_float(amax));
+            }
+            group<TILE_SIZE / WARP_THREADS>::sync(barrier_id); // in-place writes may begin
+            const float scale_inv = scale_inv_from_byte(scale_byte);
+            #pragma unroll
+            for (int j = 0; j < NUM_K_BLOCKS; j++) {
+                uint32_t x_fp8_reg[PACKED_PER_K_BLOCK / 2];
+                quantize_block_with_scale(x_bf16_reg[j], x_fp8_reg, scale_inv);
+                store_k_block((j + tid/8) % NUM_K_BLOCKS, x_fp8_reg);
             }
             scale_word = replicate_scale_byte(scale_byte);
         }
@@ -362,8 +450,10 @@ static __device__ __forceinline__ void quantize_kernel(const globals &G) {
         quantize_tile<RETURN_NORMAL, RETURN_TRANSPOSED, 128, false, false, K_BLOCK_SIZE, true>(
             x_bf16_tile, x_fp8_tile, x_sc_tile, x_fp8_t_tile, x_sc_t_tile, nullptr, tid, 1, scale_byte);
     } else {
+        __shared__ __align__(16) uint32_t column_amax_scratch[128]; // blockwise transposed pass only
         quantize_tile<RETURN_NORMAL, RETURN_TRANSPOSED, 128, false, false, K_BLOCK_SIZE>(
-            x_bf16_tile, x_fp8_tile, x_sc_tile, x_fp8_t_tile, x_sc_t_tile, nullptr, tid, 1);
+            x_bf16_tile, x_fp8_tile, x_sc_tile, x_fp8_t_tile, x_sc_t_tile, nullptr, tid, 1, 0,
+            static_cast<uint32_t>(__cvta_generic_to_shared(column_amax_scratch)));
     }
     __syncthreads();
 

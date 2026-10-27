@@ -4,8 +4,8 @@ static __device__ __forceinline__ void recompute_forward_context_kernel(const gl
     const int cta_rank = cluster_ctarank();
     const int shared_row_blocks = g.x_shared.rows() / config::MLP_Mb;
     const int minibatch_routed_row_blocks = g.minibatch_size / config::MLP_Mb;
-    const int shared_gate_up_tasks = shared_row_blocks * (g.w_shared_gate.rows() / config::MLP_Nb);
-    const int minibatch_routed_gate_up_tasks = minibatch_routed_row_blocks * (g.w_routed_gate.rows() / config::MLP_Nb);
+    const int shared_gate_up_tasks = shared_row_blocks * ceil_div(g.w_shared_gate.rows(), config::MLP_Nb);
+    const int minibatch_routed_gate_up_tasks = minibatch_routed_row_blocks * ceil_div(g.w_routed_gate.rows(), config::MLP_Nb);
     const int shared_swiglu_tiles = (g.hidden_shared.rows() / config::SWIGLU_Mb) * (g.hidden_shared.cols() / config::SWIGLU_Nb);
     const int minibatch_routed_swiglu_tiles = (g.minibatch_size / config::SWIGLU_Mb) * (g.hidden_fp8_routed.cols() / config::SWIGLU_Nb);
     const int shared_swiglu_tasks = (shared_swiglu_tiles + config::CLUSTER_SIZE * config::SWIGLU_FWD_PIPE_DEPTH - 1) / (config::CLUSTER_SIZE * config::SWIGLU_FWD_PIPE_DEPTH);
@@ -79,12 +79,14 @@ static __device__ __forceinline__ void recompute_forward_context_kernel(const gl
         const int dispatch_col_blocks = (g.x_fp8_routed.cols() + config::DISPATCH_Nb - 1) / config::DISPATCH_Nb;
         const int num_dispatch_tasks = (routed_num_tokens / config::DISPATCH_Mb) * dispatch_col_blocks;
         for (int task_idx = comm_cta_idx; task_idx < num_dispatch_tasks; task_idx += g.num_comm_sms) {
+            MOK_PROFILE_START(task_start);
             dispatch_kernel<false>(g.x_routed_send_buffer, g.x_fp8_routed, &g.x_sc_routed, &g.x_fp8_t_routed, &g.x_sc_t_routed,
                                    nullptr, g.schedule_peer_rank, g.schedule_peer_token_idx,
                                    nullptr, nullptr, g.x_routed_ready,
                                    dispatch_inputs_arrived, dispatch_bitfield,
                                    num_tokens, g.macrobatch_size, g.minibatch_size, 0, task_idx, g.topk,
                                    -1, 0, smem_base_addr);
+            MOK_PROFILE_END(task_start, mok_profile::F_DISPATCH);
         }
         return;
     }
@@ -109,6 +111,7 @@ static __device__ __forceinline__ void recompute_forward_context_kernel(const gl
 
         const int compute_cluster_idx = cluster_idx - comm_clusters;
         const bool current_is_cta_local = is_cta_local_task(compute_cluster_idx);
+        MOK_PROFILE_START(task_start);
 
         if (compute_cluster_idx < shared_gate_up_tasks) {
             // Shared gate (BF16)
@@ -175,6 +178,10 @@ static __device__ __forceinline__ void recompute_forward_context_kernel(const gl
                                   shared_gate_up_tasks, shared_row_blocks, smem_base_addr);
             }
         }
+        MOK_PROFILE_END(task_start, compute_cluster_idx < shared_tasks ? mok_profile::F_SHARED
+                        : [&] { const int t = (compute_cluster_idx - shared_tasks) % minibatch_tasks;
+                                return t < minibatch_routed_gate_up_tasks ? mok_profile::F_GATE
+                                     : t < 2 * minibatch_routed_gate_up_tasks ? mok_profile::F_UP : mok_profile::F_SWIGLU; }());
 
         wait(schedule_arrived[clc_stage], (task_iter / config::CLC_PIPE_DEPTH) % 2);
         const auto schedule = clc::query(clc_handle[clc_stage]);
@@ -250,8 +257,8 @@ recompute_forward_context_mxfp8(
     const int num_routed_minibatches = (num_routed_tokens + minibatch_size - 1) / minibatch_size;
     const int shared_row_blocks = num_local_tokens / config::MLP_Mb;
     const int routed_row_blocks = num_routed_tokens / config::MLP_Mb;
-    const int shared_gate_up_tasks = shared_row_blocks * (w_shared_gate.size(0) / config::MLP_Nb);
-    const int routed_gate_up_tasks = routed_row_blocks * (w_routed_gate.size(1) / config::MLP_Nb);
+    const int shared_gate_up_tasks = shared_row_blocks * ceil_div(intermediate_dim, config::MLP_Nb);
+    const int routed_gate_up_tasks = routed_row_blocks * ceil_div(intermediate_dim, config::MLP_Nb);
 
     activation_bf16_pgl x_routed_send_buffer_data;
     for (int i = 0; i < NUM_DEVICES; ++i)
@@ -357,8 +364,8 @@ recompute_forward_context_bf16(
     const int num_routed_minibatches = (num_routed_tokens + minibatch_size - 1) / minibatch_size;
     const int shared_row_blocks = num_local_tokens / config::MLP_Mb;
     const int routed_row_blocks = num_routed_tokens / config::MLP_Mb;
-    const int shared_gate_up_tasks = shared_row_blocks * (intermediate_dim / config::MLP_Nb);
-    const int routed_gate_up_tasks = routed_row_blocks * (intermediate_dim / config::MLP_Nb);
+    const int shared_gate_up_tasks = shared_row_blocks * ceil_div(intermediate_dim, config::MLP_Nb);
+    const int routed_gate_up_tasks = routed_row_blocks * ceil_div(intermediate_dim, config::MLP_Nb);
 
     activation_bf16_pgl x_routed_send_buffer_data;
     for (int i = 0; i < NUM_DEVICES; ++i)

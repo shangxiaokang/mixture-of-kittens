@@ -5,6 +5,7 @@
 
 #include "../mxfp8.cuh"
 #include "../utils.cuh"
+#include "profile.cuh"
 
 #include <ATen/ops/empty.h>
 #include <ATen/ops/empty_like.h>

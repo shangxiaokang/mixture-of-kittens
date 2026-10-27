@@ -320,8 +320,8 @@ def _dispatch_mlp_swiglu_combine_fwd_fp8(
     if w_shared_gate.ndim != 2:
         raise ValueError("w_shared_gate must have shape (intermediate_size, hidden_size)")
     intermediate_size = w_shared_gate.shape[0]
-    if intermediate_size <= 0 or intermediate_size % 256 != 0:
-        raise ValueError("intermediate_size must be positive and divisible by 256")
+    if intermediate_size <= 0 or intermediate_size % 128 != 0:
+        raise ValueError("intermediate_size must be positive and divisible by 128")
     if w_routed_gate.ndim != 3 or w_routed_gate.shape[0] <= 0:
         raise ValueError("w_routed_gate must have shape "
                          "(num_local_experts, intermediate_size, hidden_size)")
@@ -677,8 +677,8 @@ def dispatch_mlp_swiglu_combine_fwd_bf16(
     if w_shared_gate.ndim != 2 or w_shared_gate.shape[1] != hidden_size:
         raise ValueError("w_shared_gate must have shape (intermediate_size, hidden_size)")
     intermediate_size = w_shared_gate.shape[0]
-    if intermediate_size <= 0 or intermediate_size % 256 != 0:
-        raise ValueError("intermediate_size must be positive and divisible by 256")
+    if intermediate_size <= 0 or intermediate_size % 128 != 0:
+        raise ValueError("intermediate_size must be positive and divisible by 128")
     if w_routed_gate.ndim != 3 or w_routed_gate.shape[0] <= 0:
         raise ValueError("w_routed_gate must have shape (num_local_experts, intermediate_size, hidden_size)")
     num_local_experts = w_routed_gate.shape[0]
@@ -805,8 +805,8 @@ def _recompute_forward_context_fp8(
     if w_shared_gate.ndim != 2:
         raise ValueError("w_shared_gate must have shape (intermediate_size, hidden_size)")
     intermediate_size = w_shared_gate.shape[0]
-    if intermediate_size <= 0 or intermediate_size % 256 != 0:
-        raise ValueError("intermediate_size must be positive and divisible by 256")
+    if intermediate_size <= 0 or intermediate_size % 128 != 0:
+        raise ValueError("intermediate_size must be positive and divisible by 128")
     if w_routed_gate.ndim != 3 or w_routed_gate.shape[0] <= 0:
         raise ValueError("w_routed_gate must have shape "
                          "(num_local_experts, intermediate_size, hidden_size)")
@@ -1102,8 +1102,8 @@ def recompute_forward_context_bf16(
     if w_shared_gate.ndim != 2 or w_shared_gate.shape[1] != hidden_size:
         raise ValueError("w_shared_gate must have shape (intermediate_size, hidden_size)")
     intermediate_size = w_shared_gate.shape[0]
-    if intermediate_size <= 0 or intermediate_size % 256 != 0:
-        raise ValueError("intermediate_size must be positive and divisible by 256")
+    if intermediate_size <= 0 or intermediate_size % 128 != 0:
+        raise ValueError("intermediate_size must be positive and divisible by 128")
     if w_routed_gate.ndim != 3 or w_routed_gate.shape[0] <= 0:
         raise ValueError("w_routed_gate must have shape (num_local_experts, intermediate_size, hidden_size)")
     num_local_experts = w_routed_gate.shape[0]
@@ -1155,10 +1155,23 @@ def recompute_forward_context_bf16(
     )
 
 
+def _resolve_d_y_shared(d_y_buffer: torch.Tensor, d_y_shared: torch.Tensor | None) -> torch.Tensor:
+    """Returns the output gradient the shared expert's GEMMs consume: d_y_shared, or d_y_buffer when None."""
+    if d_y_shared is None:
+        return d_y_buffer
+    if (d_y_shared.dtype != torch.bfloat16 or tuple(d_y_shared.shape) != tuple(d_y_buffer.shape)
+            or not d_y_shared.is_contiguous()):
+        raise ValueError("d_y_shared must be a contiguous bfloat16 tensor of shape (num_local_tokens, hidden_size)")
+    if d_y_shared.device != d_y_buffer.device:
+        raise ValueError(f"d_y_shared must be on {d_y_buffer.device}")
+    return d_y_shared
+
+
 def _dispatch_mlp_swiglu_combine_bwd_fp8(
     impl,
     d_y_buffer: torch.Tensor,
     d_y_buffer_ptrs: list[int],
+    d_y_shared: torch.Tensor | None,
     d_x_routed_buffer: torch.Tensor,
     d_x_routed_buffer_ptrs: list[int],
     router_weight_buffer: torch.Tensor,
@@ -1265,8 +1278,8 @@ def _dispatch_mlp_swiglu_combine_bwd_fp8(
     if w_shared_gate.ndim != 2 or w_shared_gate.shape[1] != hidden_size:
         raise ValueError("w_shared_gate must have shape (intermediate_size, hidden_size)")
     intermediate_size = w_shared_gate.shape[0]
-    if intermediate_size <= 0 or intermediate_size % 256 != 0:
-        raise ValueError("intermediate_size must be positive and divisible by 256")
+    if intermediate_size <= 0 or intermediate_size % 128 != 0:
+        raise ValueError("intermediate_size must be positive and divisible by 128")
     if w_routed_gate.ndim != 3 or w_routed_gate.shape[0] <= 0:
         raise ValueError("w_routed_gate must have shape "
                          "(num_local_experts, intermediate_size, hidden_size)")
@@ -1312,6 +1325,7 @@ def _dispatch_mlp_swiglu_combine_bwd_fp8(
     for tensor_name, tensor, expected_shape in expected_shapes:
         if tuple(tensor.shape) != expected_shape:
             raise ValueError(f"{tensor_name} must have shape {expected_shape}")
+    d_y_shared = _resolve_d_y_shared(d_y_buffer, d_y_shared)
     for tensor_name, tensor in (
         ("d_y_buffer", d_y_buffer),
         ("d_x_routed_buffer", d_x_routed_buffer),
@@ -1361,7 +1375,7 @@ def _dispatch_mlp_swiglu_combine_bwd_fp8(
         raise ValueError("tokens_per_expert must have shape (num_local_experts,)")
 
     return impl(
-        d_y_buffer, d_y_buffer_ptrs, d_x_routed_buffer, d_x_routed_buffer_ptrs,
+        d_y_buffer, d_y_buffer_ptrs, d_y_shared, d_x_routed_buffer, d_x_routed_buffer_ptrs,
         router_weight_buffer, router_weight_buffer_ptrs,
         d_router_weight_buffer, d_router_weight_buffer_ptrs,
         w_shared_gate, w_routed_gate_T, w_routed_gate_T_sc,
@@ -1428,6 +1442,7 @@ def dispatch_mlp_swiglu_combine_bwd_mxfp8(
     num_comm_sms: int,
     macrobatch_size: int,
     minibatch_size: int,
+    d_y_shared: torch.Tensor | None = None,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -1494,6 +1509,9 @@ def dispatch_mlp_swiglu_combine_bwd_mxfp8(
         num_comm_sms:                  int
         macrobatch_size:               int
         minibatch_size:                int
+        d_y_shared:                    bfloat16 [num_local_tokens, hidden_size] | None, default None (output gradient seen
+                                       by the shared expert: None means d_y_buffer; a gated shared expert passes
+                                       shared_gate * d_y; pass it by keyword)
 
     Outputs:
         d_x_shared:          bfloat16 [num_local_tokens, hidden_size]
@@ -1519,6 +1537,7 @@ def dispatch_mlp_swiglu_combine_bwd_mxfp8(
         _C.dispatch_mlp_swiglu_combine_bwd_mxfp8,
         d_y_buffer,
         d_y_buffer_ptrs,
+        d_y_shared,
         d_x_routed_buffer,
         d_x_routed_buffer_ptrs,
         router_weight_buffer,
@@ -1614,6 +1633,7 @@ def dispatch_mlp_swiglu_combine_bwd_blockwise_fp8(
     num_comm_sms: int,
     macrobatch_size: int,
     minibatch_size: int,
+    d_y_shared: torch.Tensor | None = None,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -1683,6 +1703,9 @@ def dispatch_mlp_swiglu_combine_bwd_blockwise_fp8(
         num_comm_sms:                  int
         macrobatch_size:               int
         minibatch_size:                int
+        d_y_shared:                    bfloat16 [num_local_tokens, hidden_size] | None, default None (output gradient seen
+                                       by the shared expert: None means d_y_buffer; a gated shared expert passes
+                                       shared_gate * d_y; pass it by keyword)
 
     Outputs:
         d_x_shared:          bfloat16 [num_local_tokens, hidden_size]
@@ -1708,6 +1731,7 @@ def dispatch_mlp_swiglu_combine_bwd_blockwise_fp8(
         _C.dispatch_mlp_swiglu_combine_bwd_blockwise_fp8,
         d_y_buffer,
         d_y_buffer_ptrs,
+        d_y_shared,
         d_x_routed_buffer,
         d_x_routed_buffer_ptrs,
         router_weight_buffer,
@@ -1789,6 +1813,7 @@ def dispatch_mlp_swiglu_combine_bwd_bf16(
     num_comm_sms: int,
     macrobatch_size: int,
     minibatch_size: int,
+    d_y_shared: torch.Tensor | None = None,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -1841,6 +1866,9 @@ def dispatch_mlp_swiglu_combine_bwd_bf16(
         num_comm_sms:                  int
         macrobatch_size:               int
         minibatch_size:                int
+        d_y_shared:                    bfloat16 [num_local_tokens, hidden_size] | None, default None (output gradient seen
+                                       by the shared expert: None means d_y_buffer; a gated shared expert passes
+                                       shared_gate * d_y; pass it by keyword)
 
     Outputs:
         d_x_shared:      bfloat16 [num_local_tokens, hidden_size]
@@ -1869,8 +1897,8 @@ def dispatch_mlp_swiglu_combine_bwd_bf16(
     if w_shared_gate.ndim != 2 or w_shared_gate.shape[1] != hidden_size:
         raise ValueError("w_shared_gate must have shape (intermediate_size, hidden_size)")
     intermediate_size = w_shared_gate.shape[0]
-    if intermediate_size <= 0 or intermediate_size % 256 != 0:
-        raise ValueError("intermediate_size must be positive and divisible by 256")
+    if intermediate_size <= 0 or intermediate_size % 128 != 0:
+        raise ValueError("intermediate_size must be positive and divisible by 128")
     if w_routed_gate.ndim != 3 or w_routed_gate.shape[0] <= 0:
         raise ValueError("w_routed_gate must have shape (num_local_experts, intermediate_size, hidden_size)")
     num_local_experts = w_routed_gate.shape[0]
@@ -1937,9 +1965,10 @@ def dispatch_mlp_swiglu_combine_bwd_bf16(
             raise ValueError(f"{tensor_name} must be on {x.device}")
     if schedule_peer_rank.device != x.device:
         raise ValueError(f"schedule_peer_rank must be on {x.device}")
+    d_y_shared = _resolve_d_y_shared(d_y_buffer, d_y_shared)
 
     return _C.dispatch_mlp_swiglu_combine_bwd_bf16(
-        d_y_buffer, d_y_buffer_ptrs, d_x_routed_buffer, d_x_routed_buffer_ptrs,
+        d_y_buffer, d_y_buffer_ptrs, d_y_shared, d_x_routed_buffer, d_x_routed_buffer_ptrs,
         router_weight_buffer, router_weight_buffer_ptrs,
         d_router_weight_buffer, d_router_weight_buffer_ptrs,
         w_shared_gate, w_routed_gate, w_shared_up, w_routed_up,
@@ -1957,13 +1986,17 @@ def fwd_epilogue(
     y_shared: torch.Tensor,
     combine_buffer: torch.Tensor,
     topk_weights: torch.Tensor,
+    shared_gate: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Combines shared and router-weighted routed expert outputs.
+
+    output[t] = shared_gate[t] * y_shared[t] + sum_k topk_weights[t, k] * combine_buffer[t * topk + k]
 
     Inputs:
         y_shared:       bfloat16 [num_local_tokens, hidden_size]
         combine_buffer: bfloat16 [num_local_tokens * topk, hidden_size]
         topk_weights:   float32 [num_local_tokens, topk]
+        shared_gate:    float32 [num_local_tokens] | None (per-token scale of the shared expert output; None = 1)
 
     Outputs:
         output: bfloat16 [num_local_tokens, hidden_size]
@@ -1985,8 +2018,14 @@ def fwd_epilogue(
         raise ValueError("topk must be in [1, 255]")
     if tuple(combine_buffer.shape) != (num_local_tokens * topk, hidden_size):
         raise ValueError("combine_buffer must have shape (num_local_tokens * topk, hidden_size)")
+    if shared_gate is not None:
+        if (shared_gate.dtype != torch.float32 or tuple(shared_gate.shape) != (num_local_tokens,)
+                or not shared_gate.is_contiguous()):
+            raise ValueError("shared_gate must be a contiguous float32 tensor of shape (num_local_tokens,)")
+        if shared_gate.device != y_shared.device:
+            raise ValueError("shared_gate must be on the same CUDA device")
 
-    return _C.fwd_epilogue(y_shared, combine_buffer, topk_weights)
+    return _C.fwd_epilogue(y_shared, combine_buffer, topk_weights, shared_gate)
 
 
 @torch.library.custom_op("mok::bwd_epilogue", mutates_args=())

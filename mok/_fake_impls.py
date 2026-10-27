@@ -280,6 +280,7 @@ def _dispatch_mlp_swiglu_combine_bwd_mxfp8_fake(
     num_comm_sms: int,
     macrobatch_size: int,
     minibatch_size: int,
+    d_y_shared: torch.Tensor | None = None,
 ) -> tuple[
     torch.Tensor, torch.Tensor,  # d_x_shared, d_x_routed
     torch.Tensor, torch.Tensor, torch.Tensor,  # d_gate_shared, d_gate_fp8_routed, d_gate_sc_routed
@@ -349,6 +350,7 @@ def _dispatch_mlp_swiglu_combine_bwd_bf16_fake(
     num_comm_sms: int,
     macrobatch_size: int,
     minibatch_size: int,
+    d_y_shared: torch.Tensor | None = None,
 ) -> tuple[
     torch.Tensor, torch.Tensor,
     torch.Tensor, torch.Tensor,
@@ -386,6 +388,7 @@ def _fwd_epilogue_fake(
     y_shared: torch.Tensor,
     combine_buffer: torch.Tensor,
     topk_weights: torch.Tensor,
+    shared_gate: torch.Tensor | None = None,
 ) -> torch.Tensor:  # output
     return y_shared.new_empty(y_shared.shape)
 
